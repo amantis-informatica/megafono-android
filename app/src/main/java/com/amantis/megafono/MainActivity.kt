@@ -52,6 +52,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etiquetaDiagnostico: TextView
     private lateinit var avisoAcople: TextView
 
+    /**
+     * Cierra el paso a los avisos del motor hasta que las vistas existen.
+     * Ver el comentario de onCreate: el motor sobrevive a la Activity.
+     */
+    private var vistasListas = false
+
+    private lateinit var mandoMicro: SeekBar
+    private lateinit var valorMicro: TextView
+    private lateinit var pistaMicro: TextView
     private lateinit var mandoGanancia: SeekBar
     private lateinit var valorGanancia: TextView
 
@@ -83,17 +92,28 @@ class MainActivity : AppCompatActivity() {
 
         motor = Megafono.motor ?: MotorAudio(applicationContext).also { Megafono.motor = it }
 
-        motor.alCambiarEstado = { e -> pantalla.post { pintarEstado(e) } }
+        // El motor vive mas que esta pantalla (es el singleton de Megafono).
+        // Si el servicio ya estaba sonando, el hilo de audio puede disparar un
+        // aviso ANTES de que construirPantalla() haya creado las vistas, y
+        // pintarEstado tocaria `lateinit` sin inicializar: UninitializedProperty
+        // AccessException en el hilo principal, o sea cierre de la app al girar
+        // el movil o al volver desde la notificacion. El cerrojo es esta marca.
+        motor.alCambiarEstado = { e ->
+            pantalla.post { if (vistasListas) pintarEstado(e) }
+        }
         motor.alFallar = { msg ->
             pantalla.post {
                 Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
-                etiquetaEstado.text = msg
-                etiquetaEstado.setTextColor(PELIGRO)
-                pintarBoton(false)
+                if (vistasListas) {
+                    etiquetaEstado.text = msg
+                    etiquetaEstado.setTextColor(PELIGRO)
+                    pintarBoton(false)
+                }
             }
         }
 
         setContentView(construirPantalla())
+        vistasListas = true
         pintarBotonHablar(false)
         cargarDispositivos()
         pintarBoton(motor.estaCorriendo())
@@ -262,10 +282,43 @@ class MainActivity : AppCompatActivity() {
         col.addView(tarjetaAjustes, anchoCompleto(arriba = 12))
         tarjetaAjustes.addView(rotulo("AJUSTES"))
 
+        // Sensibilidad del microfono: ENTRADA, antes de toda la cadena.
+        val filaMicro = LinearLayout(this)
+        filaMicro.orientation = LinearLayout.HORIZONTAL
+        filaMicro.addView(etiquetaPequena("Sensibilidad del micrófono"), pesoUno())
+        valorMicro = TextView(this)
+        valorMicro.setTextColor(LIMA)
+        valorMicro.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        filaMicro.addView(valorMicro)
+        tarjetaAjustes.addView(filaMicro, anchoCompleto())
+
+        mandoMicro = SeekBar(this)
+        mandoMicro.max = 100
+        // 40 sobre 100 = x1.0. Se deja margen para BAJAR, que es lo que hace
+        // falta con un lavalier pegado a la boca.
+        mandoMicro.progress = 40
+        tenirMando(mandoMicro)
+        mandoMicro.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                val g = gananciaEntradaDe(p)
+                motor.gananciaEntrada = g
+                valorMicro.text = String.format("x%.2f", g)
+            }
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) {}
+        })
+        tarjetaAjustes.addView(mandoMicro, anchoCompleto())
+
+        pistaMicro = TextView(this)
+        pistaMicro.text = "Con el micro cerca de la boca, bájala."
+        pistaMicro.setTextColor(TEXTO_TENUE)
+        pistaMicro.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        tarjetaAjustes.addView(pistaMicro)
+
         // Volumen
         val filaGanancia = LinearLayout(this)
         filaGanancia.orientation = LinearLayout.HORIZONTAL
-        filaGanancia.addView(etiquetaPequena("Volumen"), pesoUno())
+        filaGanancia.addView(etiquetaPequena("Volumen de salida", arriba = 14), pesoUno())
         valorGanancia = TextView(this)
         valorGanancia.setTextColor(LIMA)
         valorGanancia.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
@@ -384,6 +437,8 @@ class MainActivity : AppCompatActivity() {
         col.addView(nota, anchoCompleto())
 
         // Valores iniciales de las etiquetas
+        valorMicro.text = "x1.00"
+        motor.gananciaEntrada = 1.0f
         valorGanancia.text = "x1.0"
         motor.ganancia = 1.0f
 
@@ -569,6 +624,19 @@ class MainActivity : AppCompatActivity() {
         anchoBarra(barraEntrada, e.nivelEntrada)
         anchoBarra(barraSalida, e.nivelSalida)
 
+        // El micro entrando recortado es LA causa de que suene mal, y no lo
+        // arregla nada de la cadena. Se avisa antes que cualquier otra cosa.
+        if (e.picoCrudo > 0.97f) {
+            pistaMicro.text = "⚠  El micrófono entra saturado — baja la sensibilidad"
+            pistaMicro.setTextColor(PELIGRO)
+        } else if (e.picoCrudo > 0.85f) {
+            pistaMicro.text = "Al límite — bájala un poco"
+            pistaMicro.setTextColor(AVISO)
+        } else {
+            pistaMicro.text = "Con el micro cerca de la boca, bájala."
+            pistaMicro.setTextColor(TEXTO_TENUE)
+        }
+
         if (e.notchesPuestos > 0) {
             // Se dice la frecuencia porque es informacion util: si siempre
             // pita en la misma, el problema es de colocacion del altavoz.
@@ -643,6 +711,20 @@ class MainActivity : AppCompatActivity() {
         }
         botonHablar.background = fondo
         botonHablar.isEnabled = activo
+    }
+
+    /**
+     * Convierte la posicion del mando (0..100) en sensibilidad.
+     *
+     * No es lineal a proposito: la mitad de abajo va de x0,10 a x1,00 y la de
+     * arriba de x1,00 a x4,00. Asi hay sitio fino para BAJAR, que es lo que
+     * hace falta con un lavalier pegado a la boca, en vez de tener todo el
+     * recorrido util apelotonado al principio.
+     */
+    private fun gananciaEntradaDe(p: Int): Float = if (p <= 40) {
+        0.10f + (p / 40f) * 0.90f
+    } else {
+        1.00f + ((p - 40) / 60f) * 3.00f
     }
 
     private fun anchoBarra(barra: View, nivel: Float) {

@@ -41,7 +41,12 @@ class MotorAudio(private val contexto: Context) {
         /** Cuanto esta apretando el compresor, en dB. */
         val reduccionCompresorDb: Float = 0f,
         /** Nivel de ruido de fondo que ha aprendido la puerta. */
-        val sueloRuido: Float = 0f
+        val sueloRuido: Float = 0f,
+        /**
+         * Lo que da el microfono ANTES de tocarlo. Si llega a 1,0 el micro
+         * entra recortado de origen y ningun filtro posterior lo arregla.
+         */
+        val picoCrudo: Float = 0f
     )
 
     /** Lo que se pudo activar de verdad en ESTE movil. */
@@ -65,8 +70,17 @@ class MotorAudio(private val contexto: Context) {
 
     // --- Ajustes que el usuario mueve desde la pantalla ---------------------
 
-    /** Volumen general. 1.0 = tal cual entra. */
+    /** Volumen de SALIDA. 1.0 = tal cual sale de la cadena. */
     @Volatile var ganancia: Float = 1.0f
+
+    /**
+     * Sensibilidad del MICROFONO: multiplica lo que entra, antes de todo.
+     *
+     * Es el mando que de verdad arregla "coge mucho sonido": si el micro
+     * entra pasado, la puerta da por buena la sala entera y el compresor
+     * aprieta de mas. Eso no se arregla luego bajando el volumen.
+     */
+    @Volatile var gananciaEntrada: Float = 1.0f
 
     /** Cancelacion de eco: si se fuerza, cambia la fuente de audio. */
     @Volatile var quiereAec: Boolean = true
@@ -281,7 +295,17 @@ class MotorAudio(private val contexto: Context) {
 
         // La cadena se crea aqui: sus filtros dependen de la frecuencia de
         // muestreo, que no se conoce hasta ahora.
-        cadena = CadenaAntiacople(frecuencia)
+        //
+        // Se le pasa la sensibilidad ANTES de reiniciar() y no solo dentro del
+        // bucle: el suavizado de la ganancia de entrada tiene que arrancar ya
+        // en el valor que el usuario dejo puesto. Si no, la cadena nace en x1
+        // y el primer bloque sale con la sensibilidad de fabrica -- con el
+        // mando al minimo eso son ~20 ms de micro casi diez veces mas fuerte
+        // de lo pedido, justo el petardazo al arrancar que queriamos evitar.
+        cadena = CadenaAntiacople(frecuencia).also {
+            it.gananciaEntrada = gananciaEntrada
+            it.reiniciar()
+        }
 
         corriendo = true
         reproductor?.play()
@@ -350,6 +374,7 @@ class MotorAudio(private val contexto: Context) {
 
             // Pulsar para hablar: con el dedo fuera del boton, no sale nada.
             val dejaPasar = !modoPulsar || hablando
+            c.gananciaEntrada = gananciaEntrada
             c.ganancia = if (dejaPasar) ganancia else 0f
 
             c.procesa(bloque, leidas)
@@ -371,7 +396,8 @@ class MotorAudio(private val contexto: Context) {
                     notchesPuestos = c.notchesPuestos,
                     hzAcople = c.hzAcople,
                     reduccionCompresorDb = c.reduccionCompresor,
-                    sueloRuido = c.sueloRuido
+                    sueloRuido = c.sueloRuido,
+                    picoCrudo = c.picoCrudoMedido
                 )
                 alCambiarEstado?.invoke(estado)
             }

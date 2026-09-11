@@ -1139,7 +1139,19 @@ class CadenaAntiacople(private val fs: Int) {
     @Volatile var notchesActivos = true
     @Volatile var puertaActiva = true
     @Volatile var compresorActivo = true
-    /** Ganancia general del usuario (lineal). */
+
+    /**
+     * Sensibilidad del microfono: multiplica la senal segun ENTRA, antes de
+     * que la toque nada.
+     *
+     * No es lo mismo que `ganancia`, que multiplica al SALIR. Si el micro
+     * entra demasiado fuerte, bajarlo al final no arregla nada: la puerta ya
+     * dio por buena la sala entera, el detector ya vio picos donde no los
+     * habia y el compresor ya apreto de mas. Se corrige aqui o no se corrige.
+     */
+    @Volatile var gananciaEntrada = 1f
+
+    /** Volumen de salida (lineal). Multiplica al final de la cadena. */
     @Volatile var ganancia = 1f
 
     // --- Bloques ------------------------------------------------------------
@@ -1160,9 +1172,21 @@ class CadenaAntiacople(private val fs: Int) {
     @Volatile var sueloRuido = 0f; private set
     @Volatile var reduccionCompresor = 0f; private set
 
+    /**
+     * Pico del microfono ANTES de tocarlo. Si esto llega a 1,0 el micro ya
+     * entra recortado y no hay filtro que lo arregle: hay que bajar la
+     * sensibilidad o separar el micro de la boca.
+     */
+    @Volatile var picoCrudoMedido = 0f; private set
+
     // Suavizado de la ganancia del usuario, para que mover el mando no
     // produzca un chasquido.
     private var gananciaSuave = 0f
+    // Arranca en el valor que ya tenga el mando, no en 1f fijo: la cadena se
+    // construye de cero cada vez que se pulsa "arrancar", y sembrarla en 1f
+    // haria que los primeros 20 ms sonaran con la sensibilidad de fabrica en
+    // vez de con la que el usuario dejo puesta.
+    private var gananciaEntradaSuave = gananciaEntrada
     private val coefGanancia = exp(-1.0 / (0.02 * fs)).toFloat()   // 20 ms
 
     /**
@@ -1191,6 +1215,7 @@ class CadenaAntiacople(private val fs: Int) {
         compresor.reiniciar()
         limitador.reiniciar()
         gananciaSuave = 0f
+        gananciaEntradaSuave = gananciaEntrada
     }
 
     /** Suelta todos los notches (boton "reiniciar antiacople"). */
@@ -1227,11 +1252,28 @@ class CadenaAntiacople(private val fs: Int) {
         if (muestras <= 0) return
 
         var pico = 0f
+        var picoCrudo = 0f
         var sumaCuadrados = 0f
 
         // --- Primera pasada: paso alto, notches, analisis y medidas ---------
         for (i in 0 until muestras) {
             var m = bloque[i] * (1f / 32768f)
+
+            // 0) Sensibilidad del microfono. Lo PRIMERO de todo: lo que pase
+            //    de aqui ya condiciona a la puerta, al detector y al
+            //    compresor. Se mide antes de aplicarla para poder avisar de
+            //    que el micro entra saturado de origen, que no se arregla
+            //    con ningun filtro posterior.
+            val crudo = abs(m)
+            if (crudo > picoCrudo) picoCrudo = crudo
+
+            //    OJO AL ORDEN: primero se actualiza el suavizado y luego se
+            //    aplica, igual que con la ganancia de salida del paso 6. Al
+            //    reves la primera muestra de cada bloque usaria el valor
+            //    viejo y los dos mandos irian desfasados entre si.
+            gananciaEntradaSuave = gananciaEntrada +
+                (gananciaEntradaSuave - gananciaEntrada) * coefGanancia
+            m *= gananciaEntradaSuave
 
             // 1) Paso alto.
             if (pasoAltoActivo) m = pasoAlto.procesa(m)
@@ -1259,6 +1301,7 @@ class CadenaAntiacople(private val fs: Int) {
         }
 
         picoEntrada = pico
+        picoCrudoMedido = picoCrudo
         val rms = kotlin.math.sqrt(sumaCuadrados / muestras)
 
         // --- Decisiones por bloque (no por muestra) -------------------------
