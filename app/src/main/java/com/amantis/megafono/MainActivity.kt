@@ -74,6 +74,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var interruptorPuerta: Switch
     private lateinit var interruptorCompresor: Switch
     private lateinit var interruptorPulsar: Switch
+    private lateinit var interruptorEco: Switch
+    private lateinit var interruptorVoz: Switch
 
     private val pantalla = Handler(Looper.getMainLooper())
 
@@ -286,106 +288,70 @@ class MainActivity : AppCompatActivity() {
         col.addView(tarjetaAjustes, anchoCompleto(arriba = 12))
         tarjetaAjustes.addView(rotulo("AJUSTES"))
 
-        // Sensibilidad del microfono: ENTRADA, antes de toda la cadena.
-        val filaMicro = LinearLayout(this)
-        filaMicro.orientation = LinearLayout.HORIZONTAL
-        filaMicro.addView(etiquetaPequena("Sensibilidad del micrófono"), pesoUno())
-        valorMicro = TextView(this)
-        valorMicro.setTextColor(LIMA)
-        valorMicro.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-        filaMicro.addView(valorMicro)
-        tarjetaAjustes.addView(filaMicro, anchoCompleto())
+        // ====================================================================
+        // La tarjeta va ORDENADA POR PROBLEMA, no por bloque tecnico.
+        //
+        // El usuario no llega aqui pensando "quiero un notch de 1/3 de octava";
+        // llega pensando "me pita", "me repite la voz" o "se cuela el ruido de
+        // la calle". Cada seccion lleva el nombre del sintoma y dentro van las
+        // herramientas que atacan ESE sintoma, de la que mas resuelve a la que
+        // menos.
+        // ====================================================================
 
-        mandoMicro = SeekBar(this)
-        mandoMicro.max = 100
-        // 40 sobre 100 = x1.0. Se deja margen para BAJAR, que es lo que hace
-        // falta con un lavalier pegado a la boca.
-        mandoMicro.progress = 40
-        tenirMando(mandoMicro)
-        mandoMicro.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
-                val g = gananciaEntradaDe(p)
-                motor.gananciaEntrada = g
-                valorMicro.text = String.format("x%.2f", g)
-            }
-            override fun onStartTrackingTouch(s: SeekBar?) {}
-            override fun onStopTrackingTouch(s: SeekBar?) {}
-        })
-        tarjetaAjustes.addView(mandoMicro, anchoCompleto())
+        // ---------------------------------------------------------------
+        // CONTRA EL ECO (la voz repetida)
+        // ---------------------------------------------------------------
+        tarjetaAjustes.addView(subtitulo("CONTRA EL ECO (SE OYE TU VOZ REPETIDA)", arriba = 4))
 
-        pistaMicro = TextView(this)
-        pistaMicro.text = "Con el micro cerca de la boca, bájala."
-        pistaMicro.setTextColor(TEXTO_TENUE)
-        pistaMicro.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-        tarjetaAjustes.addView(pistaMicro)
+        val filaEco = interruptor(
+            "Cancelar eco (voz repetida)",
+            "Compara lo que sale por el altavoz con lo que entra y resta el eco.",
+            false
+        ) { activo -> motor.cancelarEco = activo }
+        interruptorEco = filaEco.mando
+        tarjetaAjustes.addView(filaEco.fila, anchoCompleto())
 
-        // Volumen
-        val filaGanancia = LinearLayout(this)
-        filaGanancia.orientation = LinearLayout.HORIZONTAL
-        filaGanancia.addView(etiquetaPequena("Volumen de salida", arriba = 14), pesoUno())
-        valorGanancia = TextView(this)
-        valorGanancia.setTextColor(LIMA)
-        valorGanancia.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-        filaGanancia.addView(valorGanancia)
-        tarjetaAjustes.addView(filaGanancia, anchoCompleto())
+        val pistaEco = TextView(this)
+        pistaEco.text = "Funciona cuando lo que sale por el altavoz NO es tu " +
+            "propia voz. Si eres tú quien habla y se amplifica, este filtro " +
+            "casi no puede hacer nada: prueba antes a separar el altavoz."
+        pistaEco.setTextColor(TEXTO_TENUE)
+        pistaEco.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        pistaEco.setPadding(0, dp(4), 0, 0)
+        tarjetaAjustes.addView(pistaEco)
 
-        mandoGanancia = SeekBar(this)
-        mandoGanancia.max = 100
-        // Empezamos en x1.0: con micro y altavoz cerca, subir de entrada
-        // es pedir el pitido.
-        mandoGanancia.progress = 25
-        tenirMando(mandoGanancia)
-        mandoGanancia.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
-                // 0..100 -> 0,2 .. 4,0
-                val g = 0.2f + (p / 100f) * 3.8f
-                motor.ganancia = g
-                valorGanancia.text = String.format("x%.1f", g)
-            }
-            override fun onStartTrackingTouch(s: SeekBar?) {}
-            override fun onStopTrackingTouch(s: SeekBar?) {}
-        })
-        tarjetaAjustes.addView(mandoGanancia, anchoCompleto())
-
-        val pistaPuerta = TextView(this)
-        pistaPuerta.text = "La puerta aprende sola el ruido de la sala. " +
-            "El antiacople pone filtros en la frecuencia que pita, " +
-            "sin tocarte el volumen."
-        pistaPuerta.setTextColor(TEXTO_TENUE)
-        pistaPuerta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-        pistaPuerta.setPadding(0, dp(8), 0, 0)
-        tarjetaAjustes.addView(pistaPuerta)
-
-        // Interruptores
-        val filaAec = interruptor(
-            "Cancelación de eco",
-            "Solo con el micrófono del móvil. Con micro externo manda el micro.",
-            true
-        ) { activo ->
-            motor.quiereAec = activo
-            if (motor.estaCorriendo()) {
-                // Cambiar la fuente exige reabrir el micro: no hay otra.
-                reiniciarAudio()
-            }
-        }
-        interruptorAec = filaAec.mando
-        tarjetaAjustes.addView(filaAec.fila, anchoCompleto(arriba = 14))
+        // ---------------------------------------------------------------
+        // CONTRA EL ACOPLE (el pitido)
+        // ---------------------------------------------------------------
+        tarjetaAjustes.addView(subtitulo("CONTRA EL ACOPLE (PITIDO O ZUMBIDO)"))
 
         val filaAntiacople = interruptor(
-            "Antiacople automático",
-            "Baja el volumen solo si empieza a pitar.",
+            "Antiacople por filtros",
+            "Busca la frecuencia que pita y le clava un filtro, sin tocar el volumen.",
             true
         ) { activo -> motor.antiacople = activo }
         interruptorAntiacople = filaAntiacople.mando
-        tarjetaAjustes.addView(filaAntiacople.fila, anchoCompleto(arriba = 8))
+        tarjetaAjustes.addView(filaAntiacople.fila, anchoCompleto())
 
         val filaGraves = interruptor(
             "Filtro de graves",
-            "Quita el retumbe. Ayuda mucho contra el acople.",
+            "Quita el retumbe de sala, que es donde mas facil acopla.",
             true
         ) { activo -> motor.filtroGraves = activo }
         interruptorGraves = filaGraves.mando
         tarjetaAjustes.addView(filaGraves.fila, anchoCompleto(arriba = 8))
+
+        val filaPulsar = interruptor(
+            "Modo pulsar para hablar",
+            "Solo sale sonido con el boton pulsado. Lo mas seguro contra el acople.",
+            false
+        ) { activo ->
+            motor.modoPulsar = activo
+            if (!activo) motor.hablando = false
+            pintarBotonHablar(false)
+        }
+        interruptorPulsar = filaPulsar.mando
+        tarjetaAjustes.addView(filaPulsar.fila, anchoCompleto(arriba = 8))
 
         // Retardo de decorrelacion.
         val filaRetardo = LinearLayout(this)
@@ -447,19 +413,120 @@ class MainActivity : AppCompatActivity() {
         tarjetaAjustes.addView(mandoDesplaza, anchoCompleto())
 
         val pistaDesplaza = TextView(this)
-        pistaDesplaza.text = "Desafina levemente la señal para romper el lazo. " +
+        pistaDesplaza.text = "Desafina levemente la senal para romper el lazo. " +
             "3-5 Hz no se nota en la voz."
         pistaDesplaza.setTextColor(TEXTO_TENUE)
         pistaDesplaza.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
         tarjetaAjustes.addView(pistaDesplaza)
 
+        // ---------------------------------------------------------------
+        // CONTRA EL RUIDO
+        // ---------------------------------------------------------------
+        tarjetaAjustes.addView(subtitulo("CONTRA EL RUIDO (SE CUELA LO DE ALREDEDOR)"))
+
+        val filaVoz = interruptor(
+            "Filtro de voz",
+            "Deja pasar solo la voz y corta lo demas.",
+            false
+        ) { activo -> motor.filtroVoz = activo }
+        interruptorVoz = filaVoz.mando
+        tarjetaAjustes.addView(filaVoz.fila, anchoCompleto())
+
+        val pistaVoz = TextView(this)
+        pistaVoz.text = "Busca la estructura armonica de la voz humana. Lo que " +
+            "no la tiene (motores, golpes, siseo, pitidos) lo baja 20 dB."
+        pistaVoz.setTextColor(TEXTO_TENUE)
+        pistaVoz.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        pistaVoz.setPadding(0, dp(4), 0, 0)
+        tarjetaAjustes.addView(pistaVoz)
+
         val filaPuertaSw = interruptor(
             "Puerta de ruido",
-            "Aprende sola el ruido de la sala y lo deja fuera.",
+            "Aprende sola el ruido de la sala y lo deja fuera en los silencios.",
             true
         ) { activo -> motor.puertaActiva = activo }
         interruptorPuerta = filaPuertaSw.mando
         tarjetaAjustes.addView(filaPuertaSw.fila, anchoCompleto(arriba = 8))
+
+        val filaAec = interruptor(
+            "Cancelacion de eco del movil",
+            "La del sistema. Solo con el microfono del movil; con micro externo manda el micro.",
+            true
+        ) { activo ->
+            motor.quiereAec = activo
+            if (motor.estaCorriendo()) {
+                // Cambiar la fuente exige reabrir el micro: no hay otra.
+                reiniciarAudio()
+            }
+        }
+        interruptorAec = filaAec.mando
+        tarjetaAjustes.addView(filaAec.fila, anchoCompleto(arriba = 8))
+
+        // ---------------------------------------------------------------
+        // NIVELES
+        // ---------------------------------------------------------------
+        tarjetaAjustes.addView(subtitulo("NIVELES"))
+
+        // Sensibilidad del microfono: ENTRADA, antes de toda la cadena.
+        val filaMicro = LinearLayout(this)
+        filaMicro.orientation = LinearLayout.HORIZONTAL
+        filaMicro.addView(etiquetaPequena("Sensibilidad del microfono"), pesoUno())
+        valorMicro = TextView(this)
+        valorMicro.setTextColor(LIMA)
+        valorMicro.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        filaMicro.addView(valorMicro)
+        tarjetaAjustes.addView(filaMicro, anchoCompleto())
+
+        mandoMicro = SeekBar(this)
+        mandoMicro.max = 100
+        // 40 sobre 100 = x1.0. Se deja margen para BAJAR, que es lo que hace
+        // falta con un lavalier pegado a la boca.
+        mandoMicro.progress = 40
+        tenirMando(mandoMicro)
+        mandoMicro.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                val g = gananciaEntradaDe(p)
+                motor.gananciaEntrada = g
+                valorMicro.text = String.format("x%.2f", g)
+            }
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) {}
+        })
+        tarjetaAjustes.addView(mandoMicro, anchoCompleto())
+
+        pistaMicro = TextView(this)
+        pistaMicro.text = "Con el micro cerca de la boca, bajala."
+        pistaMicro.setTextColor(TEXTO_TENUE)
+        pistaMicro.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        tarjetaAjustes.addView(pistaMicro)
+
+        // Volumen
+        val filaGanancia = LinearLayout(this)
+        filaGanancia.orientation = LinearLayout.HORIZONTAL
+        filaGanancia.addView(etiquetaPequena("Volumen de salida", arriba = 14), pesoUno())
+        valorGanancia = TextView(this)
+        valorGanancia.setTextColor(LIMA)
+        valorGanancia.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        filaGanancia.addView(valorGanancia)
+        tarjetaAjustes.addView(filaGanancia, anchoCompleto())
+
+        mandoGanancia = SeekBar(this)
+        mandoGanancia.max = 100
+        // Empezamos bajo: con micro y altavoz cerca, subir de entrada es
+        // pedir el pitido.
+        mandoGanancia.progress = 25
+        tenirMando(mandoGanancia)
+        mandoGanancia.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                // 0..100 -> 0,2 .. 4,0
+                val g = 0.2f + (p / 100f) * 3.8f
+                motor.ganancia = g
+                valorGanancia.text = String.format("x%.1f", g)
+            }
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) {}
+        })
+        tarjetaAjustes.addView(mandoGanancia, anchoCompleto())
 
         val filaCompresor = interruptor(
             "Compresor",
@@ -467,19 +534,7 @@ class MainActivity : AppCompatActivity() {
             true
         ) { activo -> motor.compresor = activo }
         interruptorCompresor = filaCompresor.mando
-        tarjetaAjustes.addView(filaCompresor.fila, anchoCompleto(arriba = 8))
-
-        val filaPulsar = interruptor(
-            "Modo pulsar para hablar",
-            "Solo sale sonido con el botón pulsado. Lo más seguro contra el acople.",
-            false
-        ) { activo ->
-            motor.modoPulsar = activo
-            if (!activo) motor.hablando = false
-            pintarBotonHablar(false)
-        }
-        interruptorPulsar = filaPulsar.mando
-        tarjetaAjustes.addView(filaPulsar.fila, anchoCompleto(arriba = 8))
+        tarjetaAjustes.addView(filaCompresor.fila, anchoCompleto(arriba = 12))
 
         // --- Diagnóstico ----------------------------------------------------
         val tarjetaDiag = tarjeta()
@@ -709,14 +764,52 @@ class MainActivity : AppCompatActivity() {
             pistaMicro.setTextColor(TEXTO_TENUE)
         }
 
+        // El aviso junta lo que esta pasando AHORA en la cadena: filtros
+        // puestos, cuanto esta cancelando el cancelador de eco y si el filtro
+        // de voz ve voz. Todo en una linea y solo lo que este encendido, para
+        // no llenar la pantalla de numeros que no significan nada.
+        val partes = StringBuilder()
+
         if (e.notchesPuestos > 0) {
             // Se dice la frecuencia porque es informacion util: si siempre
             // pita en la misma, el problema es de colocacion del altavoz.
             val hz = if (e.hzAcople > 0f) {
                 String.format(" · último %.0f Hz", e.hzAcople)
             } else ""
-            avisoAcople.text = "🎚  " + e.notchesPuestos +
-                (if (e.notchesPuestos == 1) " filtro puesto" else " filtros puestos") + hz
+            partes.append("🎚  ").append(e.notchesPuestos)
+                .append(if (e.notchesPuestos == 1) " filtro puesto" else " filtros puestos")
+                .append(hz)
+        }
+
+        if (motor.cancelarEco) {
+            if (partes.isNotEmpty()) partes.append("\n")
+            // Solo se ensena el ERLE cuando es positivo y apreciable: por
+            // debajo de 3 dB no esta cancelando nada que se note, y poner
+            // "0 dB" solo confunde.
+            if (e.erleDb > 3f) {
+                partes.append(String.format("🔇  cancelando eco %.0f dB", e.erleDb))
+            } else {
+                partes.append("🔇  cancelador de eco sin enganchar")
+            }
+            if (e.retardoEcoMs > 0f) {
+                partes.append(String.format(" · retardo %.0f ms", e.retardoEcoMs))
+            }
+        }
+
+        if (motor.filtroVoz) {
+            if (partes.isNotEmpty()) partes.append("\n")
+            if (e.probabilidadVoz > 0.5f) {
+                val tono = if (e.tonoVozHz > 0f) {
+                    String.format(" · tono %.0f Hz", e.tonoVozHz)
+                } else ""
+                partes.append("🗣  voz detectada").append(tono)
+            } else {
+                partes.append("🗣  sin voz: dejando pasar solo el mínimo")
+            }
+        }
+
+        if (partes.isNotEmpty()) {
+            avisoAcople.text = partes.toString()
             avisoAcople.visibility = View.VISIBLE
         } else {
             avisoAcople.visibility = View.GONE
@@ -896,6 +989,22 @@ class MainActivity : AppCompatActivity() {
         fondo.setColor(TARJETA)
         fondo.setStroke(dp(1), BORDE)
         t.background = fondo
+        return t
+    }
+
+    /**
+     * Subtitulo dentro de una tarjeta, para agrupar los ajustes por el
+     * problema que atacan. El usuario no tiene por que saber que es un notch
+     * ni un NLMS; lo que si sabe es si le pita, si se oye repetido o si le
+     * entra ruido de la calle, y tiene que poder ir directo a esa seccion.
+     */
+    private fun subtitulo(texto: String, arriba: Int = 20): TextView {
+        val t = TextView(this)
+        t.text = texto
+        t.setTextColor(LIMA_OSCURO)
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        t.letterSpacing = 0.12f
+        t.setPadding(0, dp(arriba), 0, dp(6))
         return t
     }
 

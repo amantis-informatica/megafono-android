@@ -46,7 +46,15 @@ class MotorAudio(private val contexto: Context) {
          * Lo que da el microfono ANTES de tocarlo. Si llega a 1,0 el micro
          * entra recortado de origen y ningun filtro posterior lo arregla.
          */
-        val picoCrudo: Float = 0f
+        val picoCrudo: Float = 0f,
+        /** Cuanto esta cancelando el cancelador de eco, en dB (ERLE). */
+        val erleDb: Float = 0f,
+        /** Retardo medido entre altavoz y microfono, en ms. -1 si no lo sabe. */
+        val retardoEcoMs: Float = -1f,
+        /** 0..1, cuanta estructura de voz ve el filtro de voz. */
+        val probabilidadVoz: Float = 0f,
+        /** Tono fundamental de la voz detectado, en Hz. -1 si no hay. */
+        val tonoVozHz: Float = -1f
     )
 
     /** Lo que se pudo activar de verdad en ESTE movil. */
@@ -87,6 +95,26 @@ class MotorAudio(private val contexto: Context) {
 
     /** Antiacople automatico. */
     @Volatile var antiacople: Boolean = true
+
+    /**
+     * Cancelador de eco PROPIO (el de la cadena, no el del sistema).
+     *
+     * Ataca la voz repetida. Viene APAGADO de fabrica, y no por prudencia
+     * boba: medido, en lazo cerrado (que es como funciona un megafono, con la
+     * propia voz saliendo por el altavoz) no aporta nada, entre -0,4 y
+     * +0,5 dB, y en la prueba de ganancia antes de acoplar incluso la
+     * empeoraba. Donde SI da sus 25-37 dB es en lazo abierto, o sea cuando lo
+     * que sale por el altavoz no es la voz que entra por el microfono. El
+     * interruptor esta ahi para quien tenga ese caso. Ver la cabecera de
+     * [CanceladorEco] para el porque.
+     */
+    @Volatile var cancelarEco: Boolean = false
+
+    /**
+     * Filtro de voz: deja pasar lo que tiene estructura armonica de voz y
+     * corta lo demas. Ataca el ruido de sala.
+     */
+    @Volatile var filtroVoz: Boolean = false
 
     /** Filtro de graves: quita el retumbe, que es donde mas acopla. */
     @Volatile var filtroGraves: Boolean = true
@@ -381,6 +409,8 @@ class MotorAudio(private val contexto: Context) {
             val c = cadena ?: continue
             c.pasoAltoActivo = filtroGraves
             c.notchesActivos = antiacople
+            c.aecActivo = cancelarEco
+            c.filtroVozActivo = filtroVoz
             c.compresorActivo = compresor
             c.puertaActiva = puertaActiva
 
@@ -411,7 +441,11 @@ class MotorAudio(private val contexto: Context) {
                     hzAcople = c.hzAcople,
                     reduccionCompresorDb = c.reduccionCompresor,
                     sueloRuido = c.sueloRuido,
-                    picoCrudo = c.picoCrudoMedido
+                    picoCrudo = c.picoCrudoMedido,
+                    erleDb = c.erleAec,
+                    retardoEcoMs = c.retardoEcoMs,
+                    probabilidadVoz = c.probabilidadVoz,
+                    tonoVozHz = c.tonoVozHz
                 )
                 alCambiarEstado?.invoke(estado)
             }
