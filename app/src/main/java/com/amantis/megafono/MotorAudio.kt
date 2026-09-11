@@ -33,7 +33,11 @@ class MotorAudio(private val contexto: Context) {
         val nivelSalida: Float = 0f,
         val puertaAbierta: Boolean = false,
         val acoplando: Boolean = false,
-        val reduccionAcople: Float = 1f
+        val reduccionAcople: Float = 1f,
+        /** Callados a proposito para romper el lazo de acople. */
+        val enSilencioPorAcople: Boolean = false,
+        /** Milisegundos que quedan de ese silencio. */
+        val msSilencioRestante: Int = 0
     )
 
     /** Lo que se pudo activar de verdad en ESTE movil. */
@@ -45,7 +49,14 @@ class MotorAudio(private val contexto: Context) {
         val agcDisponible: Boolean = false,
         val nombreEntrada: String = "-",
         val nombreSalida: String = "-",
-        val frecuencia: Int = 0
+        val frecuencia: Int = 0,
+        /**
+         * El micro que pedimos NO es por el que entra el sonido de verdad.
+         * Android nos ha ignorado: hay que avisar, no callar.
+         */
+        val entradaNoRespetada: Boolean = false,
+        /** Se renuncio al AEC del sistema para poder usar el micro elegido. */
+        val aecCedidoPorMicro: Boolean = false
     )
 
     // --- Ajustes que el usuario mueve desde la pantalla ---------------------
@@ -64,6 +75,25 @@ class MotorAudio(private val contexto: Context) {
 
     /** Filtro de graves: quita el retumbe, que es donde mas acopla. */
     @Volatile var filtroGraves: Boolean = true
+
+    /**
+     * Al detectar acople, callar del todo un segundo.
+     *
+     * Bajar el volumen a veces no basta: mientras quede algo de sonido el
+     * lazo sigue vivo y el pitido vuelve a subir. Cortar por completo mata
+     * el lazo de raiz y la sala se queda limpia.
+     */
+    @Volatile var silenciarAlAcoplar: Boolean = true
+
+    /** Cuanto dura ese silencio, en milisegundos. */
+    @Volatile var msSilencioAcople: Int = 1000
+
+    /**
+     * Pulsar para hablar: mientras esta activo, solo sale sonido si
+     * `hablando` es cierto.
+     */
+    @Volatile var modoPulsar: Boolean = false
+    @Volatile var hablando: Boolean = false
 
     /**
      * Entrada y salida elegidas a mano. `null` = que decida Android
@@ -87,6 +117,13 @@ class MotorAudio(private val contexto: Context) {
 
     @Volatile private var corriendo = false
     private var hiloAudio: Thread? = null
+
+    /**
+     * Si tocamos el modo de audio del movil hay que devolverlo como estaba,
+     * o el resto de apps (y las llamadas) se quedan raras.
+     */
+    private var modoPrevio: Int? = null
+    private var pusimosDispositivoComunicacion = false
 
     private var grabador: AudioRecord? = null
     private var reproductor: AudioTrack? = null
@@ -112,6 +149,14 @@ class MotorAudio(private val contexto: Context) {
     // Historial para detectar el acople (energia de los ultimos bloques)
     private val historialEnergia = FloatArray(24)
     private var indiceHistorial = 0
+
+    // Muestras que quedan de silencio forzado por acople. Se cuenta en
+    // muestras y no en reloj para no depender de cuando llega cada bloque.
+    private var muestrasDeSilencio = 0
+
+    // Volumen que se aplica de verdad, persiguiendo al objetivo poco a poco
+    // para que ningun corte suene como un chasquido.
+    private var factorSuave = 0f
 
     private var frecuencia = 48000
 
@@ -143,9 +188,34 @@ class MotorAudio(private val contexto: Context) {
             return false
         }
 
-        // La fuente decide si Android nos da el cancelador de eco.
-        // VOICE_COMMUNICATION lo activa.
-        val fuente = if (quiereAec) {
+        // Que micro quiere el usuario (null = que elija Android).
+        val microPedido: AudioDeviceInfo? = idEntradaElegida.let { id ->
+            if (id == null) {
+                buscarMicrofonoExterno(audioManager)
+            } else {
+                audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+                    .firstOrNull { it.id == id }
+            }
+        }
+
+        // AQUI ESTA EL CONFLICTO, y no se puede tener todo:
+        //
+        // VOICE_COMMUNICATION es lo unico que enciende el cancelador de eco,
+        // pero en ese modo el enrutado lo manda la politica de comunicacion
+        // del sistema, no nosotros: `preferredDevice` es una PREFERENCIA, y
+        // Android la ignora tranquilamente y se queda con el micro interno.
+        // Por eso el lavalier no entraba aunque se eligiera en la lista.
+        //
+        // Con un micro USB el AEC ademas no sirve de mucho: esta calibrado
+        // para la geometria micro-interno/altavoz del propio movil.
+        //
+        // Decision: si el usuario ha pedido un micro EXTERNO, mandamos el
+        // micro y renunciamos al AEC del sistema. El eco lo tapan la puerta
+        // de ruido, el filtro de graves y el antiacople, que ya estaban.
+        val micExterno = microPedido != null && esExterno(microPedido)
+        val cederAec = quiereAec && micExterno
+
+        val fuente = if (quiereAec && !cederAec) {
             MediaRecorder.AudioSource.VOICE_COMMUNICATION
         } else {
             MediaRecorder.AudioSource.MIC
@@ -172,19 +242,22 @@ class MotorAudio(private val contexto: Context) {
             return false
         }
 
-        // Con VOICE_COMMUNICATION, Android tira del microfono interno por su
-        // cuenta y se salta el lavalier. Elegir la fuente NO elige el micro:
-        // hay que exigirlo aparte. Asi se queda el AEC Y el micro externo.
-        val idE = idEntradaElegida
-        grabador?.preferredDevice = if (idE == null) {
-            buscarMicrofonoExterno(audioManager)
-        } else {
-            audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
-                .firstOrNull { it.id == idE }
+        // `setPreferredDevice` devuelve si la peticion valia. Antes se tiraba
+        // el resultado con el setter de Kotlin y no nos enterabamos de nada.
+        // Ojo: true solo dice "peticion aceptada", NO que se este usando ese
+        // micro. Quien manda la verdad es `routedDevice`, ya grabando.
+        if (microPedido != null) {
+            grabador?.setPreferredDevice(microPedido)
+        }
+
+        // Si seguimos en modo comunicacion, hay que pedir el enrutado por la
+        // via buena (API 31+). Aun asi el sistema puede decir que no.
+        if (fuente == MediaRecorder.AudioSource.VOICE_COMMUNICATION) {
+            fijarRutaDeComunicacion(audioManager, microPedido)
         }
 
         val sesion = grabador!!.audioSessionId
-        val parAec = activarAec(sesion)
+        val parAec = activarAec(sesion, quiereAec && !cederAec)
         val parSup = activarSupresor(sesion)
         val agcHay = AutomaticGainControl.isAvailable()
 
@@ -240,7 +313,9 @@ class MotorAudio(private val contexto: Context) {
             agcDisponible = agcHay,
             nombreEntrada = describirEntrada(audioManager),
             nombreSalida = describirSalida(audioManager),
-            frecuencia = frecuencia
+            frecuencia = frecuencia,
+            entradaNoRespetada = nosIgnoraronElMicro(microPedido),
+            aecCedidoPorMicro = cederAec
         )
 
         hiloAudio = thread(name = "megafono-audio", priority = Thread.MAX_PRIORITY) {
@@ -351,6 +426,13 @@ class MotorAudio(private val contexto: Context) {
                     // Bajar rapido, que el pitido crece en decimas de segundo.
                     reduccion *= 0.90f
                     if (reduccion < 0.12f) reduccion = 0.12f
+
+                    // Bajar el volumen no siempre rompe el lazo: mientras
+                    // quede algo de sonido el pitido puede volver a subir.
+                    // Callar del todo un segundo lo mata y limpia la sala.
+                    if (silenciarAlAcoplar && muestrasDeSilencio <= 0) {
+                        muestrasDeSilencio = (frecuencia * msSilencioAcople) / 1000
+                    }
                 } else {
                     // Recuperar despacio, para no volver a provocarlo.
                     reduccion += (1f - reduccion) * 0.004f
@@ -362,11 +444,33 @@ class MotorAudio(private val contexto: Context) {
 
             // 4) Volumen final + limitador. El limitador es la ultima red:
             //    por mucha ganancia que pongas, no deja saturar.
-            val factor = ganancia * suavizadoPuerta * reduccion
+
+            // Silencio total tras detectar acople: corta el lazo de raiz.
+            val callados = muestrasDeSilencio > 0
+            if (callados) {
+                muestrasDeSilencio -= leidas
+                if (muestrasDeSilencio < 0) muestrasDeSilencio = 0
+                // Al volver, arrancamos bajito: si se vuelve al volumen de
+                // antes de golpe, el pitido reaparece en el acto.
+                if (muestrasDeSilencio == 0) reduccion = 0.30f
+            }
+
+            // Pulsar para hablar: con el dedo fuera del boton, no sale nada.
+            val dejaPasar = !modoPulsar || hablando
+
+            val factor = if (callados || !dejaPasar) {
+                0f
+            } else {
+                ganancia * suavizadoPuerta * reduccion
+            }
             var picoSalida = 0f
 
             for (i in 0 until leidas) {
-                var m = (salida[i] / 32768f) * factor
+                // Llegar al volumen nuevo poco a poco dentro del bloque: si
+                // se salta de golpe a cero (o vuelve de cero), se oye un
+                // "clac" muy feo en el altavoz.
+                factorSuave += (factor - factorSuave) * 0.02f
+                var m = (salida[i] / 32768f) * factorSuave
 
                 val amplitud = abs(m)
                 // Envolvente del limitador: ataque casi instantaneo.
@@ -398,7 +502,9 @@ class MotorAudio(private val contexto: Context) {
                     nivelSalida = picoSalida,
                     puertaAbierta = suavizadoPuerta > 0.5f,
                     acoplando = acoplando,
-                    reduccionAcople = reduccion
+                    reduccionAcople = reduccion,
+                    enSilencioPorAcople = callados,
+                    msSilencioRestante = (muestrasDeSilencio * 1000) / frecuencia
                 )
                 alCambiarEstado?.invoke(estado)
             }
@@ -407,11 +513,75 @@ class MotorAudio(private val contexto: Context) {
 
     // ------------------------------------------------------------------------
 
-    private fun activarAec(sesion: Int): Pair<Boolean, Boolean> {
+    /** Un micro que NO es el del propio movil. */
+    private fun esExterno(d: AudioDeviceInfo): Boolean = when (d.type) {
+        AudioDeviceInfo.TYPE_USB_HEADSET,
+        AudioDeviceInfo.TYPE_USB_DEVICE,
+        AudioDeviceInfo.TYPE_USB_ACCESSORY,
+        AudioDeviceInfo.TYPE_WIRED_HEADSET,
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> true
+        else -> false
+    }
+
+    /**
+     * Comprueba si Android nos hizo caso, preguntando por donde entra el
+     * sonido DE VERDAD. Se llama ya grabando: antes `routedDevice` es null.
+     */
+    private fun nosIgnoraronElMicro(pedido: AudioDeviceInfo?): Boolean {
+        if (pedido == null) return false
+        val real = try { grabador?.routedDevice } catch (e: Exception) { null }
+            ?: return false
+        return real.id != pedido.id
+    }
+
+    /**
+     * La via oficial para mandar el enrutado en modo comunicacion (API 31+).
+     *
+     * Detalle importante: `setCommunicationDevice` SOLO acepta dispositivos
+     * de SALIDA; el micro que le corresponde lo elige la plataforma sola. Con
+     * un lavalier USB que solo tiene microfono, esto no lo puede seleccionar,
+     * y por eso no es la solucion para este caso. Lo dejamos por si el USB
+     * tambien saca sonido (auricular USB con micro), que entonces si arrastra
+     * la entrada.
+     */
+    @androidx.annotation.RequiresApi(android.os.Build.VERSION_CODES.S)
+    private fun fijarRutaDeComunicacionS(
+        am: AudioManager,
+        microPedido: AudioDeviceInfo
+    ) {
+        try {
+            // Buscamos la SALIDA que pertenece al mismo cacharro.
+            val gemelo = am.getAvailableCommunicationDevices().firstOrNull {
+                it.type == microPedido.type &&
+                    it.productName == microPedido.productName
+            } ?: return
+
+            if (modoPrevio == null) modoPrevio = am.mode
+            am.mode = AudioManager.MODE_IN_COMMUNICATION
+            pusimosDispositivoComunicacion = am.setCommunicationDevice(gemelo)
+        } catch (e: Exception) {
+            // Si el fabricante no lo soporta, seguimos: ya hay aviso en pantalla.
+        }
+    }
+
+    /** Envoltorio con la comprobacion de version, para no repetirla. */
+    private fun fijarRutaDeComunicacion(am: AudioManager, microPedido: AudioDeviceInfo?) {
+        if (microPedido == null) return
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            fijarRutaDeComunicacionS(am, microPedido)
+        }
+    }
+
+    /**
+     * `lo Queremos` no es `quiereAec` a secas: si hemos cedido el AEC para
+     * poder usar el micro externo, aqui va false aunque el interruptor de la
+     * pantalla siga puesto. Asi el diagnostico no miente.
+     */
+    private fun activarAec(sesion: Int, loQueremos: Boolean): Pair<Boolean, Boolean> {
         if (!AcousticEchoCanceler.isAvailable()) return Pair(false, false)
         return try {
             aec = AcousticEchoCanceler.create(sesion)
-            aec?.enabled = quiereAec
+            aec?.enabled = loQueremos
             Pair(true, aec?.enabled == true)
         } catch (e: Exception) {
             Pair(true, false)
@@ -452,16 +622,35 @@ class MotorAudio(private val contexto: Context) {
         return lista
     }
 
-    /** Aplica la eleccion del usuario sin tener que parar el audio. */
-    fun aplicarDispositivosElegidos() {
+    /**
+     * Aplica la eleccion del usuario sin parar el audio.
+     *
+     * Devuelve `true` si hace falta reabrir el micro: cambiar entre micro
+     * interno y externo cambia la FUENTE (VOICE_COMMUNICATION vs MIC), y eso
+     * no se puede cambiar en caliente. Quien llama decide si reinicia.
+     */
+    fun aplicarDispositivosElegidos(): Boolean {
         val am = contexto.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
         val idE = idEntradaElegida
-        grabador?.preferredDevice = if (idE == null) {
+        val microPedido = if (idE == null) {
             buscarMicrofonoExterno(am)
         } else {
             am.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.id == idE }
         }
+
+        // Si el nuevo micro exige otra fuente distinta a la que esta abierta,
+        // no vale con reenrutar: hay que reabrir.
+        val queremosExterno = microPedido != null && esExterno(microPedido)
+        val fuenteQueTocaria = if (quiereAec && !queremosExterno) {
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION
+        } else {
+            MediaRecorder.AudioSource.MIC
+        }
+        val fuenteAbierta = grabador?.audioSource
+        if (fuenteAbierta != null && fuenteAbierta != fuenteQueTocaria) return true
+
+        if (microPedido != null) grabador?.setPreferredDevice(microPedido)
 
         val idS = idSalidaElegida
         reproductor?.preferredDevice = if (idS == null) {
@@ -473,8 +662,10 @@ class MotorAudio(private val contexto: Context) {
         // Releer por donde va de verdad tras el cambio.
         capacidades = capacidades.copy(
             nombreEntrada = describirEntrada(am),
-            nombreSalida = describirSalida(am)
+            nombreSalida = describirSalida(am),
+            entradaNoRespetada = nosIgnoraronElMicro(microPedido)
         )
+        return false
     }
 
     /**
@@ -561,6 +752,22 @@ class MotorAudio(private val contexto: Context) {
     }
 
     private fun liberar() {
+        // Devolver el movil como estaba. Si nos dejamos MODE_IN_COMMUNICATION
+        // puesto, el resto de apps y las llamadas se quedan tocadas.
+        try {
+            val am = contexto.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            if (pusimosDispositivoComunicacion &&
+                android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S
+            ) {
+                am.clearCommunicationDevice()
+            }
+            modoPrevio?.let { am.mode = it }
+        } catch (e: Exception) {
+        } finally {
+            pusimosDispositivoComunicacion = false
+            modoPrevio = null
+        }
+
         try { grabador?.stop() } catch (e: Exception) {}
         try { reproductor?.stop() } catch (e: Exception) {}
         aec?.release(); aec = null
@@ -574,6 +781,8 @@ class MotorAudio(private val contexto: Context) {
         reduccion = 1f
         suavizadoPuerta = 0f
         muestrasDesdeVoz = 0
+        muestrasDeSilencio = 0
+        factorSuave = 0f
         historialEnergia.fill(0f)
     }
 }

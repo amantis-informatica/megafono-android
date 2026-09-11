@@ -10,6 +10,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.AdapterView
@@ -37,6 +38,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var motor: MotorAudio
 
     private lateinit var botonPrincipal: Button
+    private lateinit var botonHablar: Button
     private lateinit var barraEntrada: View
     private lateinit var barraSalida: View
     private lateinit var etiquetaEstado: TextView
@@ -58,6 +60,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var interruptorAec: Switch
     private lateinit var interruptorAntiacople: Switch
     private lateinit var interruptorGraves: Switch
+    private lateinit var interruptorSilencio: Switch
+    private lateinit var interruptorPulsar: Switch
 
     private val pantalla = Handler(Looper.getMainLooper())
 
@@ -91,6 +95,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         setContentView(construirPantalla())
+        pintarBotonHablar(false)
         cargarDispositivos()
         pintarBoton(motor.estaCorriendo())
         if (motor.estaCorriendo()) mostrarDiagnostico()
@@ -141,13 +146,48 @@ class MainActivity : AppCompatActivity() {
         subtitulo.setPadding(0, dp(2), 0, dp(20))
         col.addView(subtitulo)
 
-        // --- Botón principal ------------------------------------------------
+        // --- Botones: Empezar/Parar y Pulsar para hablar --------------------
+        val filaBotones = LinearLayout(this)
+        filaBotones.orientation = LinearLayout.HORIZONTAL
+
         botonPrincipal = Button(this)
         botonPrincipal.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
         botonPrincipal.isAllCaps = false
         botonPrincipal.setPadding(0, dp(20), 0, dp(20))
         botonPrincipal.setOnClickListener { alPulsarPrincipal() }
-        col.addView(botonPrincipal, anchoCompleto())
+        val pB = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        pB.rightMargin = dp(6)
+        filaBotones.addView(botonPrincipal, pB)
+
+        botonHablar = Button(this)
+        botonHablar.text = "Pulsar para hablar"
+        botonHablar.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+        botonHablar.isAllCaps = false
+        botonHablar.setPadding(0, dp(20), 0, dp(20))
+        // Mantener pulsado = hablar. Al soltar se corta, tambien si el dedo
+        // se sale del boton sin levantarlo (ACTION_CANCEL): si no, se
+        // quedaria el microfono abierto sin querer.
+        botonHablar.setOnTouchListener { v, evento ->
+            when (evento.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    motor.hablando = true
+                    pintarBotonHablar(true)
+                    v.performClick()
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    motor.hablando = false
+                    pintarBotonHablar(false)
+                    true
+                }
+                else -> false
+            }
+        }
+        val pH = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        pH.leftMargin = dp(6)
+        filaBotones.addView(botonHablar, pH)
+
+        col.addView(filaBotones, anchoCompleto())
 
         // --- Aviso de acople ------------------------------------------------
         avisoAcople = TextView(this)
@@ -287,7 +327,7 @@ class MainActivity : AppCompatActivity() {
         // Interruptores
         val filaAec = interruptor(
             "Cancelación de eco",
-            "Déjala puesta. El micrófono se elige arriba.",
+            "Solo con el micrófono del móvil. Con micro externo manda el micro.",
             true
         ) { activo ->
             motor.quiereAec = activo
@@ -314,6 +354,26 @@ class MainActivity : AppCompatActivity() {
         ) { activo -> motor.filtroGraves = activo }
         interruptorGraves = filaGraves.mando
         tarjetaAjustes.addView(filaGraves.fila, anchoCompleto(arriba = 8))
+
+        val filaSilencio = interruptor(
+            "Callar 1 s al acoplar",
+            "Corta del todo para romper el pitido y limpiar la sala.",
+            true
+        ) { activo -> motor.silenciarAlAcoplar = activo }
+        interruptorSilencio = filaSilencio.mando
+        tarjetaAjustes.addView(filaSilencio.fila, anchoCompleto(arriba = 8))
+
+        val filaPulsar = interruptor(
+            "Modo pulsar para hablar",
+            "Solo sale sonido con el botón pulsado. Lo más seguro contra el acople.",
+            false
+        ) { activo ->
+            motor.modoPulsar = activo
+            if (!activo) motor.hablando = false
+            pintarBotonHablar(false)
+        }
+        interruptorPulsar = filaPulsar.mando
+        tarjetaAjustes.addView(filaPulsar.fila, anchoCompleto(arriba = 8))
 
         // --- Diagnóstico ----------------------------------------------------
         val tarjetaDiag = tarjeta()
@@ -364,8 +424,13 @@ class MainActivity : AppCompatActivity() {
         montarLista(listaEntradas, entradas, motor.idEntradaElegida) { elegido ->
             motor.idEntradaElegida = elegido
             if (motor.estaCorriendo()) {
-                motor.aplicarDispositivosElegidos()
-                mostrarDiagnostico()
+                // Cambiar de micro interno a externo (o al reves) cambia la
+                // fuente de audio, y eso obliga a reabrir el microfono.
+                if (motor.aplicarDispositivosElegidos()) {
+                    reiniciarAudio()
+                } else {
+                    mostrarDiagnostico()
+                }
             }
         }
 
@@ -497,7 +562,19 @@ class MainActivity : AppCompatActivity() {
         lineas.append("\n").append(marca(true))
             .append("  Frecuencia: ").append(c.frecuencia).append(" Hz")
 
-        if (!c.aecDisponible) {
+        if (c.entradaNoRespetada) {
+            lineas.append("\n\n⚠  Has elegido un micrófono, pero el móvil está ")
+            lineas.append("cogiendo el sonido de otro. Es cosa del fabricante: ")
+            lineas.append("prueba a desenchufar y volver a enchufar el micro, ")
+            lineas.append("o a parar y arrancar otra vez.")
+        }
+
+        if (c.aecCedidoPorMicro) {
+            lineas.append("\n\nCon micrófono externo se apaga el cancelador de ")
+            lineas.append("eco del sistema: es la única forma de que entre el ")
+            lineas.append("sonido por ese micro. Del acople se encargan la ")
+            lineas.append("puerta de ruido y el antiacople.")
+        } else if (!c.aecDisponible) {
             lineas.append("\n\nSin cancelador de eco del sistema, quien hace el ")
             lineas.append("trabajo es la puerta de ruido y el antiacople.")
         }
@@ -511,11 +588,21 @@ class MainActivity : AppCompatActivity() {
         anchoBarra(barraEntrada, e.nivelEntrada)
         anchoBarra(barraSalida, e.nivelSalida)
 
-        avisoAcople.visibility = if (e.acoplando) View.VISIBLE else View.GONE
+        if (e.enSilencioPorAcople) {
+            avisoAcople.text = "🔇  Callado " + e.msSilencioRestante + " ms para cortar el acople"
+            avisoAcople.visibility = View.VISIBLE
+        } else if (e.acoplando) {
+            avisoAcople.text = "⚠  Acople detectado — bajando volumen"
+            avisoAcople.visibility = View.VISIBLE
+        } else {
+            avisoAcople.visibility = View.GONE
+        }
 
         if (!motor.estaCorriendo()) return
 
         etiquetaEstado.text = when {
+            e.enSilencioPorAcople -> "Callado un momento para romper el acople"
+            motor.modoPulsar && !motor.hablando -> "Listo — mantén pulsado para hablar"
             e.acoplando -> String.format(
                 "Conteniendo acople — volumen al %.0f%%", e.reduccionAcople * 100f
             )
@@ -524,6 +611,7 @@ class MainActivity : AppCompatActivity() {
         }
         etiquetaEstado.setTextColor(
             when {
+                e.enSilencioPorAcople -> AVISO
                 e.acoplando -> AVISO
                 e.puertaAbierta -> LIMA
                 else -> TEXTO_TENUE
@@ -544,6 +632,35 @@ class MainActivity : AppCompatActivity() {
             botonPrincipal.setTextColor(FONDO)
         }
         botonPrincipal.background = fondo
+    }
+
+    /**
+     * El boton de hablar se enciende mientras se tiene el dedo encima.
+     * Apagado cuando el modo no esta activo, para que se vea que no hace nada.
+     */
+    private fun pintarBotonHablar(pulsado: Boolean) {
+        val activo = motor.modoPulsar
+        val fondo = GradientDrawable()
+        fondo.cornerRadius = dp(14).toFloat()
+
+        when {
+            !activo -> {
+                fondo.setColor(Color.TRANSPARENT)
+                fondo.setStroke(dp(1), BORDE)
+                botonHablar.setTextColor(TEXTO_TENUE)
+            }
+            pulsado -> {
+                fondo.setColor(LIMA)
+                botonHablar.setTextColor(FONDO)
+            }
+            else -> {
+                fondo.setColor(Color.TRANSPARENT)
+                fondo.setStroke(dp(2), LIMA)
+                botonHablar.setTextColor(LIMA)
+            }
+        }
+        botonHablar.background = fondo
+        botonHablar.isEnabled = activo
     }
 
     private fun anchoBarra(barra: View, nivel: Float) {
