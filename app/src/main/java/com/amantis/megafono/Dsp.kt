@@ -1141,6 +1141,24 @@ class CadenaAntiacople(private val fs: Int) {
     @Volatile var compresorActivo = true
 
     /**
+     * Retardo de decorrelacion en milisegundos (0 = apagado).
+     *
+     * Sube el margen antes de acoplar a cambio de latencia. Con el altavoz
+     * por Bluetooth el retardo ya es grande, asi que unos pocos ms mas no
+     * cambian la sensacion y si reparten los picos del lazo.
+     */
+    @Volatile var msDecorrelacion = 0f
+
+    /**
+     * Desplazamiento de frecuencia en Hz (0 = apagado).
+     *
+     * La otra forma de romper el lazo, y mas barata en latencia que el
+     * retardo: en vez de mover CUANDO vuelve la senal, mueve QUE frecuencia
+     * vuelve. 3-5 Hz no se notan en la voz y suben bastante el margen.
+     */
+    @Volatile var hzDesplazamiento = 0f
+
+    /**
      * Sensibilidad del microfono: multiplica la senal segun ENTRA, antes de
      * que la toque nada.
      *
@@ -1156,12 +1174,20 @@ class CadenaAntiacople(private val fs: Int) {
 
     // --- Bloques ------------------------------------------------------------
     private val pasoAlto = Biquad()
-    private val notches = BancoNotches(fs, cuantos = 8, octavas = 0.1f)
+    // 1/3 de octava, no 1/10. La nota tecnica 158 de Rane lo dice claro: los
+    // notches estrechos rinden PEOR cuando la sala cambia (alguien se mueve,
+    // se gira el altavoz), porque el pico del acople se les escapa al lado y
+    // hay que meterles 20 dB para conseguir poco. Uno mas ancho y suave
+    // sigue tapando el pitido aunque se desplace un poco, y se nota menos en
+    // la voz.
+    private val notches = BancoNotches(fs, cuantos = 8, octavas = 0.33f)
     private val decimador = Decimador(fs, factor = 4)
     private val detector = DetectorAcople(fsAnalisis = fs / 4, nFft = 512)
     private val puerta = PuertaAdaptativa(fs)
     private val compresor = Compresor(fs)
     private val limitador = Limitador(fs, msAnticipacion = 5f)
+    private val decorrelacion = RetardoDecorrelacion(fs, msMaximos = 40f)
+    private val desplazador = DesplazadorFrecuencia(fs, taps = 101)
 
     // --- Medidas para la pantalla ------------------------------------------
     @Volatile var picoEntrada = 0f; private set
@@ -1214,6 +1240,8 @@ class CadenaAntiacople(private val fs: Int) {
         puerta.reiniciar()
         compresor.reiniciar()
         limitador.reiniciar()
+        decorrelacion.reiniciar()
+        desplazador.reiniciar()
         gananciaSuave = 0f
         gananciaEntradaSuave = gananciaEntrada
     }
@@ -1230,7 +1258,13 @@ class CadenaAntiacople(private val fs: Int) {
      * acoplar. 5 ms es un precio pequeno por quitar la distorsion de picos,
      * pero no conviene subirlo alegremente.
      */
-    fun retardoMs(): Float = limitador.retardoMuestras() * 1000f / fs
+    fun retardoMs(): Float {
+        // El desplazador solo cuenta si esta encendido: apagado no llega a
+        // meter la senal en su linea de retardo, asi que no retrasa nada.
+        val msDesplaza =
+            if (hzDesplazamiento != 0f) desplazador.retardoMuestras() * 1000f / fs else 0f
+        return limitador.retardoMuestras() * 1000f / fs + msDecorrelacion + msDesplaza
+    }
 
     /**
      * Procesa un bloque, EN EL SITIO, de PCM 16 bits.
@@ -1305,6 +1339,7 @@ class CadenaAntiacople(private val fs: Int) {
         val rms = kotlin.math.sqrt(sumaCuadrados / muestras)
 
         // --- Decisiones por bloque (no por muestra) -------------------------
+        decorrelacion.muestras = ((msDecorrelacion * fs) / 1000f).toInt()
         puerta.actualiza(rms, muestras)
         puertaAbierta = puerta.abierta
         sueloRuido = puerta.sueloRuido
@@ -1313,8 +1348,18 @@ class CadenaAntiacople(private val fs: Int) {
 
         // --- Segunda pasada: puerta, compresor, ganancia y limitador --------
         var picoOut = 0f
+        // Se lee UNA vez por bloque, no por muestra: si el usuario mueve el
+        // mando a mitad de bloque, el salto de fase del oscilador daria un
+        // chasquido. Asi el cambio cae siempre en el borde de un bloque.
+        val hzDesp = hzDesplazamiento
         for (i in 0 until muestras) {
             var m = intermedio[i]
+
+            // 3b) Desplazamiento de frecuencia. Va DENTRO del lazo (despues
+            //     de los notches, antes de la puerta): tiene que estar en el
+            //     camino de la senal amplificada para que lo que vuelva al
+            //     microfono venga ya desafinado.
+            m = desplazador.procesa(m, hzDesp)
 
             // 4) Puerta.
             if (puertaActiva) m *= puerta.siguienteGanancia()
@@ -1326,7 +1371,11 @@ class CadenaAntiacople(private val fs: Int) {
             gananciaSuave = ganancia + (gananciaSuave - ganancia) * coefGanancia
             m *= gananciaSuave
 
-            // 7) Limitador con anticipacion. Siempre el ultimo.
+            // 7) Retardo de decorrelacion: mueve las frecuencias donde la
+            //    sala realimenta, para que ninguna se lleve toda la ganancia.
+            m = decorrelacion.procesa(m)
+
+            // 8) Limitador con anticipacion. Siempre el ultimo.
             m = limitador.procesa(m)
 
             val a = abs(m)
@@ -1342,4 +1391,248 @@ class CadenaAntiacople(private val fs: Int) {
     fun notchFrecuencia(i: Int) = notches.frecuenciaDe(i)
     fun notchProfundidad(i: Int) = notches.profundidadDe(i)
     fun notchesCapacidad() = notches.capacidad()
+}
+
+// ---------------------------------------------------------------------------
+// 10) RETARDO DE DECORRELACION
+// ---------------------------------------------------------------------------
+
+/**
+ * Retrasa la salida unos milisegundos.
+ *
+ * Es una de las tecnicas clasicas de megafonia y parece contraintuitiva:
+ * anadir retardo para que acople MENOS. La razon es que el lazo de la sala
+ * refuerza unas frecuencias concretas (las que vuelven en fase); al cambiar
+ * el tiempo de vuelta, esas frecuencias se mueven y se reparten, en vez de
+ * juntarse siempre en los mismos picos. Ningun tono concreto se lleva toda
+ * la ganancia del lazo.
+ *
+ * Se paga en latencia, asi que conviene poco: 5-20 ms.
+ */
+class RetardoDecorrelacion(fs: Int, msMaximos: Float = 40f) {
+
+    private val buffer = FloatArray(((fs * msMaximos) / 1000f).toInt().coerceAtLeast(1))
+    private var escribe = 0
+
+    /** Retardo pedido, en muestras. 0 = pasa directo. */
+    @Volatile var muestras = 0
+        set(v) {
+            field = v.coerceIn(0, buffer.size - 1)
+        }
+
+    fun reiniciar() {
+        buffer.fill(0f)
+        escribe = 0
+    }
+
+    fun procesa(x: Float): Float {
+        val n = muestras
+        if (n <= 0) return x
+
+        buffer[escribe] = x
+        // Leer n muestras por detras de donde escribimos.
+        var lee = escribe - n
+        if (lee < 0) lee += buffer.size
+        val y = buffer[lee]
+
+        escribe++
+        if (escribe >= buffer.size) escribe = 0
+        return y
+    }
+
+    fun capacidadMs(fs: Int): Float = buffer.size * 1000f / fs
+}
+
+// ---------------------------------------------------------------------------
+// 11) DESPLAZADOR DE FRECUENCIA
+// ---------------------------------------------------------------------------
+
+/**
+ * Desplaza TODO el espectro unos pocos Hz hacia arriba.
+ *
+ * Es la tecnica de Schroeder (1964), y es la hermana fina del retardo de
+ * decorrelacion. El lazo de la sala se realimenta porque la senal vuelve al
+ * microfono EN FASE consigo misma: cada vuelta refuerza la anterior y el
+ * tono crece hasta el pitido. Si cada vuelta sale con la frecuencia movida
+ * unos pocos Hz, la senal ya nunca coincide consigo misma: tras varias
+ * vueltas el tono se ha ido tan lejos del pico de la sala que deja de
+ * encontrar ganancia, y el lazo no llega a cerrarse. Se ganan del orden de
+ * 6 a 10 dB antes de acoplar.
+ *
+ * Por que 5 Hz y no 50: el oido no nota un desplazamiento pequeno en la voz
+ * (los formantes se mueven todos juntos y el cerebro lo ignora), pero SI
+ * nota que las relaciones armonicas se rompen. A 5 Hz la voz suena igual;
+ * pasado de ahi empieza a sonar metalica, y con musica se nota mucho antes
+ * porque los acordes se desafinan entre si.
+ *
+ * COMO se hace: modulacion SSB (banda lateral unica). Multiplicar por un
+ * coseno sin mas no vale, porque genera las DOS bandas laterales (una
+ * subida y otra bajada) y el resultado suena a modulador en anillo. Hay que
+ * construir primero la senal analitica (la senal y su version desfasada 90
+ * grados, que da la transformada de Hilbert) y luego modular en cuadratura:
+ *
+ *     y = re * cos(2*pi*f*t) - im * sin(2*pi*f*t)
+ *
+ * El termino que se resta cancela la banda inferior y solo sobrevive la
+ * superior, que es justo el espectro entero corrido +f Hz.
+ *
+ * La parte imaginaria sale de un FIR de Hilbert, y la real del MISMO
+ * numero de muestras de retardo, porque si no las dos partes no hablarian
+ * del mismo instante y la cancelacion de la banda no seria limpia.
+ */
+class DesplazadorFrecuencia(private val fs: Int, taps: Int = 101) {
+
+    /**
+     * El FIR de Hilbert tiene que tener un numero IMPAR de taps (101, no
+     * 100) para que el centro caiga sobre una muestra exacta. Asi el retardo
+     * del filtro son (taps-1)/2 muestras JUSTAS y la parte real se puede
+     * alinear con un simple retardo entero. Con taps par el centro caeria
+     * entre dos muestras y haria falta interpolar.
+     */
+    private val n = if (taps % 2 == 0) taps + 1 else taps
+    private val centro = n / 2
+
+    /** Coeficientes del FIR de Hilbert, con ventana de Blackman. */
+    private val h = FloatArray(n)
+
+    /**
+     * Linea de retardo circular COMPARTIDA por las dos ramas: la imaginaria
+     * la convoluciona entera y la real solo lee la muestra del centro. Un
+     * unico buffer y una unica escritura por muestra.
+     */
+    private val linea = FloatArray(n)
+    private var escribe = 0
+
+    // Oscilador por recurrencia: girar un vector unitario multiplicandolo
+    // por (cosPaso, sinPaso) en cada muestra sale mucho mas barato que
+    // llamar a sin/cos, que en el hilo de audio si se notan. El precio es
+    // que el vector pierde modulo por redondeo, asi que se renormaliza cada
+    // cierto tiempo (ver mas abajo).
+    private var oscCos = 1f
+    private var oscSin = 0f
+    private var pasoCos = 1f
+    private var pasoSin = 0f
+    private var cuentaNormaliza = 0
+
+    /** Hz del ultimo paso calculado, para no rehacer el seno por muestra. */
+    private var hzActual = Float.NaN
+
+    init {
+        // Respuesta ideal del Hilbert: h[k] = 2/(pi*k) para k impar, 0 para
+        // k par. Se trunca a n taps y se enventana con Blackman, que deja el
+        // rizado de la banda de paso por debajo de 0,1 dB; con truncado a
+        // secas (ventana rectangular) el rizado de Gibbs llegaria a 1 dB y
+        // la banda lateral no cancelaria bien en los extremos.
+        //
+        // OJO AL SIGNO: en la convolucion el tap h[i] multiplica a la
+        // muestra retrasada i, asi que el nucleo se recorre AL REVES que el
+        // eje k de la formula. Si se escribe +2/(pi*k) tal cual, lo que sale
+        // es MENOS la transformada de Hilbert, y entonces la modulacion en
+        // cuadratura cancela la banda que no toca: el espectro baja 5 Hz en
+        // vez de subirlos. Medido: el pico salia en 995 Hz, no en 1005. De
+        // ahi el signo negativo.
+        for (i in 0 until n) {
+            val k = i - centro
+            val ideal = if (k % 2 == 0) 0.0 else -2.0 / (Math.PI * k)
+            val t = 2.0 * Math.PI * i / (n - 1)
+            val w = 0.42 - 0.5 * cos(t) + 0.08 * cos(2.0 * t)
+            h[i] = (ideal * w).toFloat()
+        }
+    }
+
+    /**
+     * Retardo que introduce, en muestras. Es el del FIR y es FIJO: no
+     * depende del desplazamiento pedido. Se expone para que la cadena lo
+     * pueda sumar a lo que le ensena al usuario.
+     */
+    fun retardoMuestras(): Int = centro
+
+    fun reiniciar() {
+        linea.fill(0f)
+        escribe = 0
+        oscCos = 1f
+        oscSin = 0f
+        cuentaNormaliza = 0
+    }
+
+    /**
+     * Procesa una muestra.
+     *
+     * @param x  muestra de entrada
+     * @param hz desplazamiento pedido. 0 = paso directo.
+     */
+    fun procesa(x: Float, hz: Float): Float {
+        // Apagado: se sale ANTES de tocar la linea de retardo. Asi no se
+        // gasta CPU en convolucionar 101 taps para nada y, sobre todo, no se
+        // anade el retardo del FIR cuando el usuario no ha pedido nada. La
+        // contrapartida es que al encender se arranca con la linea llena de
+        // ceros; son 101 muestras a 48 kHz (2 ms), no se oye.
+        if (hz == 0f) return x
+
+        // El paso del oscilador solo se recalcula cuando el usuario mueve el
+        // mando, no en cada muestra.
+        if (hz != hzActual) {
+            hzActual = hz
+            val w = 2.0 * Math.PI * hz / fs
+            pasoCos = cos(w).toFloat()
+            pasoSin = sin(w).toFloat()
+        }
+
+        // Meter la muestra en la linea circular.
+        linea[escribe] = x
+        escribe++
+        if (escribe >= n) escribe = 0
+
+        // Convolucion del Hilbert. Tras avanzar, `escribe` apunta a la
+        // muestra MAS ANTIGUA (la que se pisara la proxima vez), que es
+        // justo la que multiplica a h[0].
+        var im = 0f
+        var idx = escribe
+        for (i in 0 until n) {
+            // La mitad de los taps son cero (los de indice par respecto al
+            // centro): saltarselos ahorra la mitad de las multiplicaciones.
+            if ((i - centro) % 2 != 0) im += h[i] * linea[idx]
+            idx++
+            if (idx >= n) idx = 0
+        }
+
+        // Parte real: la misma senal retardada `centro` muestras, para que
+        // las dos ramas hablen del mismo instante.
+        var idxRe = escribe + centro
+        if (idxRe >= n) idxRe -= n
+        val re = linea[idxRe]
+
+        // Modulacion en cuadratura. El signo menos es lo que cancela la
+        // banda lateral inferior y deja solo la superior (desplazamiento
+        // hacia ARRIBA).
+        val y = re * oscCos - im * oscSin
+
+        // Girar el oscilador una muestra: (cos,sin) *= (pasoCos,pasoSin).
+        val nuevoCos = oscCos * pasoCos - oscSin * pasoSin
+        val nuevoSin = oscSin * pasoCos + oscCos * pasoSin
+        oscCos = nuevoCos
+        oscSin = nuevoSin
+
+        // La recurrencia pierde modulo poco a poco (en float se nota en
+        // segundos). Sin esto la senal se iria apagando o creciendo sola.
+        // Renormalizar lleva una raiz cuadrada, asi que se hace una vez cada
+        // 1024 muestras (21 ms a 48 kHz): el error acumulado en ese tramo es
+        // despreciable y el coste se reparte.
+        cuentaNormaliza++
+        if (cuentaNormaliza >= 1024) {
+            cuentaNormaliza = 0
+            val mod = kotlin.math.sqrt(oscCos * oscCos + oscSin * oscSin)
+            if (mod > 1e-6f) {
+                oscCos /= mod
+                oscSin /= mod
+            } else {
+                // No deberia pasar nunca, pero si el modulo llegase a cero el
+                // oscilador quedaria muerto y la salida muda para siempre.
+                oscCos = 1f
+                oscSin = 0f
+            }
+        }
+
+        return y
+    }
 }

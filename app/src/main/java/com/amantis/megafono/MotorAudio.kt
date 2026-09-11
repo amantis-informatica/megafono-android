@@ -91,6 +91,18 @@ class MotorAudio(private val contexto: Context) {
     /** Filtro de graves: quita el retumbe, que es donde mas acopla. */
     @Volatile var filtroGraves: Boolean = true
 
+    /**
+     * Retardo de decorrelacion en ms. Sube el margen antes de acoplar a
+     * cambio de latencia. 0 = apagado.
+     */
+    @Volatile var msDecorrelacion: Float = 0f
+
+    /**
+     * Desplazamiento de frecuencia en Hz. Rompe el lazo desafinando la senal
+     * unos pocos Hz, sin gastar latencia como el retardo. 0 = apagado.
+     */
+    @Volatile var hzDesplazamiento: Float = 0f
+
     /** Compresor: iguala la voz para que no sature al levantar la voz. */
     @Volatile var compresor: Boolean = true
 
@@ -375,6 +387,8 @@ class MotorAudio(private val contexto: Context) {
             // Pulsar para hablar: con el dedo fuera del boton, no sale nada.
             val dejaPasar = !modoPulsar || hablando
             c.gananciaEntrada = gananciaEntrada
+            c.msDecorrelacion = msDecorrelacion
+            c.hzDesplazamiento = hzDesplazamiento
             c.ganancia = if (dejaPasar) ganancia else 0f
 
             c.procesa(bloque, leidas)

@@ -61,6 +61,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var mandoMicro: SeekBar
     private lateinit var valorMicro: TextView
     private lateinit var pistaMicro: TextView
+    private lateinit var mandoRetardo: SeekBar
+    private lateinit var valorRetardo: TextView
+    private lateinit var mandoDesplaza: SeekBar
+    private lateinit var valorDesplaza: TextView
     private lateinit var mandoGanancia: SeekBar
     private lateinit var valorGanancia: TextView
 
@@ -383,6 +387,72 @@ class MainActivity : AppCompatActivity() {
         interruptorGraves = filaGraves.mando
         tarjetaAjustes.addView(filaGraves.fila, anchoCompleto(arriba = 8))
 
+        // Retardo de decorrelacion.
+        val filaRetardo = LinearLayout(this)
+        filaRetardo.orientation = LinearLayout.HORIZONTAL
+        filaRetardo.addView(etiquetaPequena("Antiacople por retardo", arriba = 14), pesoUno())
+        valorRetardo = TextView(this)
+        valorRetardo.setTextColor(LIMA)
+        valorRetardo.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        valorRetardo.setPadding(0, dp(14), 0, 0)
+        filaRetardo.addView(valorRetardo)
+        tarjetaAjustes.addView(filaRetardo, anchoCompleto())
+
+        mandoRetardo = SeekBar(this)
+        mandoRetardo.max = 30
+        mandoRetardo.progress = 0
+        tenirMando(mandoRetardo)
+        mandoRetardo.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                motor.msDecorrelacion = p.toFloat()
+                valorRetardo.text = if (p == 0) "apagado" else (p.toString() + " ms")
+            }
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) {}
+        })
+        tarjetaAjustes.addView(mandoRetardo, anchoCompleto())
+
+        val pistaRetardo = TextView(this)
+        pistaRetardo.text = "Mueve las frecuencias donde la sala acopla. " +
+            "Sube hasta que deje de pitar: 10-20 ms suele bastar."
+        pistaRetardo.setTextColor(TEXTO_TENUE)
+        pistaRetardo.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        tarjetaAjustes.addView(pistaRetardo)
+
+        // Desplazamiento de frecuencia.
+        val filaDesplaza = LinearLayout(this)
+        filaDesplaza.orientation = LinearLayout.HORIZONTAL
+        filaDesplaza.addView(
+            etiquetaPequena("Antiacople por desplazamiento", arriba = 14), pesoUno()
+        )
+        valorDesplaza = TextView(this)
+        valorDesplaza.setTextColor(LIMA)
+        valorDesplaza.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        valorDesplaza.setPadding(0, dp(14), 0, 0)
+        filaDesplaza.addView(valorDesplaza)
+        tarjetaAjustes.addView(filaDesplaza, anchoCompleto())
+
+        mandoDesplaza = SeekBar(this)
+        mandoDesplaza.max = 12
+        mandoDesplaza.progress = 0
+        tenirMando(mandoDesplaza)
+        mandoDesplaza.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                motor.hzDesplazamiento = p.toFloat()
+                valorDesplaza.text = if (p == 0) "apagado" else (p.toString() + " Hz")
+            }
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) {}
+        })
+        tarjetaAjustes.addView(mandoDesplaza, anchoCompleto())
+
+        val pistaDesplaza = TextView(this)
+        pistaDesplaza.text = "Desafina levemente la señal para romper el lazo. " +
+            "3-5 Hz no se nota en la voz."
+        pistaDesplaza.setTextColor(TEXTO_TENUE)
+        pistaDesplaza.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        tarjetaAjustes.addView(pistaDesplaza)
+
         val filaPuertaSw = interruptor(
             "Puerta de ruido",
             "Aprende sola el ruido de la sala y lo deja fuera.",
@@ -437,6 +507,8 @@ class MainActivity : AppCompatActivity() {
         col.addView(nota, anchoCompleto())
 
         // Valores iniciales de las etiquetas
+        valorRetardo.text = "apagado"
+        valorDesplaza.text = "apagado"
         valorMicro.text = "x1.00"
         motor.gananciaEntrada = 1.0f
         valorGanancia.text = "x1.0"
