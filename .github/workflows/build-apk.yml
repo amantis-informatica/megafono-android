@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   apk:
     runs-on: ubuntu-latest
@@ -50,3 +53,14 @@ jobs:
           path: salida/MegafonoAmantis.apk
           # 14 dias: lo justo para descargarla sin acumular almacenamiento.
           retention-days: 14
+
+      # Una Release ademas del artefacto: el artefacto exige credenciales
+      # para bajarlo, la Release se descarga con un enlace directo.
+      - name: Publicar Release descargable
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ultima
+          name: Megafono Amantis (ultima compilacion)
+          files: salida/MegafonoAmantis.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
