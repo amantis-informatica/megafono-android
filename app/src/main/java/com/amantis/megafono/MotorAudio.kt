@@ -34,10 +34,14 @@ class MotorAudio(private val contexto: Context) {
         val puertaAbierta: Boolean = false,
         val acoplando: Boolean = false,
         val reduccionAcople: Float = 1f,
-        /** Callados a proposito para romper el lazo de acople. */
-        val enSilencioPorAcople: Boolean = false,
-        /** Milisegundos que quedan de ese silencio. */
-        val msSilencioRestante: Int = 0
+        /** Cuantos filtros hay puestos ahora mismo contra el acople. */
+        val notchesPuestos: Int = 0,
+        /** En que frecuencia se detecto el ultimo pitido (Hz), o -1. */
+        val hzAcople: Float = -1f,
+        /** Cuanto esta apretando el compresor, en dB. */
+        val reduccionCompresorDb: Float = 0f,
+        /** Nivel de ruido de fondo que ha aprendido la puerta. */
+        val sueloRuido: Float = 0f
     )
 
     /** Lo que se pudo activar de verdad en ESTE movil. */
@@ -64,9 +68,6 @@ class MotorAudio(private val contexto: Context) {
     /** Volumen general. 1.0 = tal cual entra. */
     @Volatile var ganancia: Float = 1.0f
 
-    /** Por debajo de este nivel no sale nada. Mata el acople en los silencios. */
-    @Volatile var umbralPuerta: Float = 0.015f
-
     /** Cancelacion de eco: si se fuerza, cambia la fuente de audio. */
     @Volatile var quiereAec: Boolean = true
 
@@ -76,17 +77,11 @@ class MotorAudio(private val contexto: Context) {
     /** Filtro de graves: quita el retumbe, que es donde mas acopla. */
     @Volatile var filtroGraves: Boolean = true
 
-    /**
-     * Al detectar acople, callar del todo un segundo.
-     *
-     * Bajar el volumen a veces no basta: mientras quede algo de sonido el
-     * lazo sigue vivo y el pitido vuelve a subir. Cortar por completo mata
-     * el lazo de raiz y la sala se queda limpia.
-     */
-    @Volatile var silenciarAlAcoplar: Boolean = true
+    /** Compresor: iguala la voz para que no sature al levantar la voz. */
+    @Volatile var compresor: Boolean = true
 
-    /** Cuanto dura ese silencio, en milisegundos. */
-    @Volatile var msSilencioAcople: Int = 1000
+    /** Puerta de ruido con umbral que se aprende solo. */
+    @Volatile var puertaActiva: Boolean = true
 
     /**
      * Pulsar para hablar: mientras esta activo, solo sale sonido si
@@ -125,6 +120,12 @@ class MotorAudio(private val contexto: Context) {
     private var modoPrevio: Int? = null
     private var pusimosDispositivoComunicacion = false
 
+    /**
+     * Toda la cadena de proceso. Se crea al arrancar, cuando ya se sabe la
+     * frecuencia de muestreo: los filtros dependen de ella.
+     */
+    private var cadena: CadenaAntiacople? = null
+
     private var grabador: AudioRecord? = null
     private var reproductor: AudioTrack? = null
     private var aec: AcousticEchoCanceler? = null
@@ -137,26 +138,6 @@ class MotorAudio(private val contexto: Context) {
     /** Avisos para la interfaz. */
     var alCambiarEstado: ((Estado) -> Unit)? = null
     var alFallar: ((String) -> Unit)? = null
-
-    // Memoria de los filtros (se conserva entre bloques de audio)
-    private var pasoAltoX1 = 0f
-    private var pasoAltoY1 = 0f
-    private var envolventeSalida = 0f
-    private var reduccion = 1f
-    private var muestrasDesdeVoz = 0
-    private var suavizadoPuerta = 0f
-
-    // Historial para detectar el acople (energia de los ultimos bloques)
-    private val historialEnergia = FloatArray(24)
-    private var indiceHistorial = 0
-
-    // Muestras que quedan de silencio forzado por acople. Se cuenta en
-    // muestras y no en reloj para no depender de cuando llega cada bloque.
-    private var muestrasDeSilencio = 0
-
-    // Volumen que se aplica de verdad, persiguiendo al objetivo poco a poco
-    // para que ningun corte suene como un chasquido.
-    private var factorSuave = 0f
 
     private var frecuencia = 48000
 
@@ -298,6 +279,10 @@ class MotorAudio(private val contexto: Context) {
                 .firstOrNull { it.id == idS }
         }
 
+        // La cadena se crea aqui: sus filtros dependen de la frecuencia de
+        // muestreo, que no se conoce hasta ahora.
+        cadena = CadenaAntiacople(frecuencia)
+
         corriendo = true
         reproductor?.play()
         grabador?.startRecording()
@@ -345,7 +330,6 @@ class MotorAudio(private val contexto: Context) {
         // sin que el sistema se ahogue en llamadas.
         val muestrasBloque = frecuencia / 100
         val bloque = ShortArray(muestrasBloque)
-        val salida = ShortArray(muestrasBloque)
         var contadorAvisos = 0
 
         while (corriendo) {
@@ -355,156 +339,39 @@ class MotorAudio(private val contexto: Context) {
                 continue
             }
 
-            var picoEntrada = 0f
-            var sumaCuadrados = 0f
-
-            for (i in 0 until leidas) {
-                var m = bloque[i] / 32768f
-
-                // 1) Filtro de graves (paso alto ~120 Hz). El acople casi
-                //    siempre empieza por abajo: quitando retumbe se gana mucho.
-                if (filtroGraves) {
-                    val y = 0.985f * (pasoAltoY1 + m - pasoAltoX1)
-                    pasoAltoX1 = m
-                    pasoAltoY1 = y
-                    m = y
-                }
-
-                val amplitud = abs(m)
-                if (amplitud > picoEntrada) picoEntrada = amplitud
-                sumaCuadrados += m * m
-
-                // Sin recortar aqui, el filtro puede pasarse de 1.0 y
-                // toShort() da la vuelta al signo: un chasquido muy audible.
-                salida[i] = (m.coerceIn(-1f, 1f) * 32767f).toInt().toShort()
-            }
-
-            val rms = sqrt(sumaCuadrados / leidas)
-
-            // 2) Puerta de ruido. Si no hablas, no sale nada: es la defensa
-            //    mas eficaz contra el acople, porque el pitido nace y crece
-            //    justo en los silencios.
-            val hayVoz = rms > umbralPuerta
-            if (hayVoz) {
-                muestrasDesdeVoz = 0
-            } else {
-                muestrasDesdeVoz += leidas
-            }
-            // Cola de ~250 ms para no cortar el final de las palabras.
-            val colaAbierta = muestrasDesdeVoz < frecuencia / 4
-            val objetivoPuerta = if (hayVoz || colaAbierta) 1f else 0f
-            // Subida rapida, bajada suave: abrir tarde corta silabas,
-            // cerrar de golpe hace un "clac" muy feo.
-            val paso = if (objetivoPuerta > suavizadoPuerta) 0.25f else 0.02f
-            suavizadoPuerta += (objetivoPuerta - suavizadoPuerta) * paso
-
-            // 3) Antiacople: si la energia se mantiene alta y constante mucho
-            //    rato, eso no es voz, es un lazo realimentandose. La voz
-            //    fluctua; el pitido no.
-            historialEnergia[indiceHistorial] = rms
-            indiceHistorial = (indiceHistorial + 1) % historialEnergia.size
-
-            var acoplando = false
-            if (antiacople) {
-                var media = 0f
-                for (v in historialEnergia) media += v
-                media /= historialEnergia.size
-
-                if (media > 0.08f) {
-                    // Cuanta variacion hay respecto a la media.
-                    var varianza = 0f
-                    for (v in historialEnergia) {
-                        val d = v - media
-                        varianza += d * d
-                    }
-                    varianza /= historialEnergia.size
-                    // Energia alta + poca variacion = lazo.
-                    acoplando = sqrt(varianza) < media * 0.22f
-                }
-
-                if (acoplando) {
-                    // Bajar rapido, que el pitido crece en decimas de segundo.
-                    reduccion *= 0.90f
-                    if (reduccion < 0.12f) reduccion = 0.12f
-
-                    // Bajar el volumen no siempre rompe el lazo: mientras
-                    // quede algo de sonido el pitido puede volver a subir.
-                    // Callar del todo un segundo lo mata y limpia la sala.
-                    if (silenciarAlAcoplar && muestrasDeSilencio <= 0) {
-                        muestrasDeSilencio = (frecuencia * msSilencioAcople) / 1000
-                    }
-                } else {
-                    // Recuperar despacio, para no volver a provocarlo.
-                    reduccion += (1f - reduccion) * 0.004f
-                    if (reduccion > 1f) reduccion = 1f
-                }
-            } else {
-                reduccion = 1f
-            }
-
-            // 4) Volumen final + limitador. El limitador es la ultima red:
-            //    por mucha ganancia que pongas, no deja saturar.
-
-            // Silencio total tras detectar acople: corta el lazo de raiz.
-            val callados = muestrasDeSilencio > 0
-            if (callados) {
-                muestrasDeSilencio -= leidas
-                if (muestrasDeSilencio < 0) muestrasDeSilencio = 0
-                // Al volver, arrancamos bajito: si se vuelve al volumen de
-                // antes de golpe, el pitido reaparece en el acto.
-                if (muestrasDeSilencio == 0) reduccion = 0.30f
-            }
+            // Toda la cadena vive en CadenaAntiacople: paso alto, notches
+            // contra el acople, puerta adaptativa, compresor y limitador.
+            // Aqui solo se le pasan los ajustes y se le da el bloque.
+            val c = cadena ?: continue
+            c.pasoAltoActivo = filtroGraves
+            c.notchesActivos = antiacople
+            c.compresorActivo = compresor
+            c.puertaActiva = puertaActiva
 
             // Pulsar para hablar: con el dedo fuera del boton, no sale nada.
             val dejaPasar = !modoPulsar || hablando
+            c.ganancia = if (dejaPasar) ganancia else 0f
 
-            val factor = if (callados || !dejaPasar) {
-                0f
-            } else {
-                ganancia * suavizadoPuerta * reduccion
-            }
-            var picoSalida = 0f
+            c.procesa(bloque, leidas)
 
-            for (i in 0 until leidas) {
-                // Llegar al volumen nuevo poco a poco dentro del bloque: si
-                // se salta de golpe a cero (o vuelve de cero), se oye un
-                // "clac" muy feo en el altavoz.
-                factorSuave += (factor - factorSuave) * 0.02f
-                var m = (salida[i] / 32768f) * factorSuave
-
-                val amplitud = abs(m)
-                // Envolvente del limitador: ataque casi instantaneo.
-                envolventeSalida = if (amplitud > envolventeSalida) {
-                    amplitud
-                } else {
-                    envolventeSalida * 0.9995f
-                }
-                if (envolventeSalida > 0.92f) {
-                    m *= 0.92f / envolventeSalida
-                }
-
-                if (m > 1f) m = 1f
-                if (m < -1f) m = -1f
-
-                val a = abs(m)
-                if (a > picoSalida) picoSalida = a
-                salida[i] = (m * 32767f).toInt().toShort()
-            }
-
-            reproductor?.write(salida, 0, leidas)
+            reproductor?.write(bloque, 0, leidas)
 
             // Avisar a la pantalla ~10 veces por segundo, no en cada bloque.
             contadorAvisos++
             if (contadorAvisos >= 10) {
                 contadorAvisos = 0
                 estado = Estado(
-                    nivelEntrada = picoEntrada,
-                    nivelSalida = picoSalida,
-                    puertaAbierta = suavizadoPuerta > 0.5f,
-                    acoplando = acoplando,
-                    reduccionAcople = reduccion,
-                    enSilencioPorAcople = callados,
-                    msSilencioRestante = (muestrasDeSilencio * 1000) / frecuencia
+                    nivelEntrada = c.picoEntrada,
+                    nivelSalida = c.picoSalida,
+                    puertaAbierta = c.puertaAbierta,
+                    // Ahora "acoplando" significa que hay notches puestos:
+                    // el pitido se quita por frecuencia, no bajando el volumen.
+                    acoplando = c.notchesPuestos > 0,
+                    reduccionAcople = 1f,
+                    notchesPuestos = c.notchesPuestos,
+                    hzAcople = c.hzAcople,
+                    reduccionCompresorDb = c.reduccionCompresor,
+                    sueloRuido = c.sueloRuido
                 )
                 alCambiarEstado?.invoke(estado)
             }
@@ -775,14 +642,7 @@ class MotorAudio(private val contexto: Context) {
         agc?.release(); agc = null
         grabador?.release(); grabador = null
         reproductor?.release(); reproductor = null
-        pasoAltoX1 = 0f
-        pasoAltoY1 = 0f
-        envolventeSalida = 0f
-        reduccion = 1f
-        suavizadoPuerta = 0f
-        muestrasDesdeVoz = 0
-        muestrasDeSilencio = 0
-        factorSuave = 0f
-        historialEnergia.fill(0f)
+        cadena?.reiniciar()
+        cadena = null
     }
 }

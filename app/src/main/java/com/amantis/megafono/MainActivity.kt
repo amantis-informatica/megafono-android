@@ -54,13 +54,12 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var mandoGanancia: SeekBar
     private lateinit var valorGanancia: TextView
-    private lateinit var mandoPuerta: SeekBar
-    private lateinit var valorPuerta: TextView
 
     private lateinit var interruptorAec: Switch
     private lateinit var interruptorAntiacople: Switch
     private lateinit var interruptorGraves: Switch
-    private lateinit var interruptorSilencio: Switch
+    private lateinit var interruptorPuerta: Switch
+    private lateinit var interruptorCompresor: Switch
     private lateinit var interruptorPulsar: Switch
 
     private val pantalla = Handler(Looper.getMainLooper())
@@ -291,37 +290,13 @@ class MainActivity : AppCompatActivity() {
         })
         tarjetaAjustes.addView(mandoGanancia, anchoCompleto())
 
-        // Puerta de ruido
-        val filaPuerta = LinearLayout(this)
-        filaPuerta.orientation = LinearLayout.HORIZONTAL
-        filaPuerta.addView(etiquetaPequena("Puerta de ruido", arriba = 10), pesoUno())
-        valorPuerta = TextView(this)
-        valorPuerta.setTextColor(LIMA)
-        valorPuerta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-        valorPuerta.setPadding(0, dp(10), 0, 0)
-        filaPuerta.addView(valorPuerta)
-        tarjetaAjustes.addView(filaPuerta, anchoCompleto())
-
-        mandoPuerta = SeekBar(this)
-        mandoPuerta.max = 100
-        mandoPuerta.progress = 30
-        tenirMando(mandoPuerta)
-        mandoPuerta.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
-                // 0..100 -> 0,000 .. 0,050
-                val u2 = (p / 100f) * 0.05f
-                motor.umbralPuerta = u2
-                valorPuerta.text = if (p == 0) "abierta" else String.format("%.0f%%", p.toFloat())
-            }
-            override fun onStartTrackingTouch(s: SeekBar?) {}
-            override fun onStopTrackingTouch(s: SeekBar?) {}
-        })
-        tarjetaAjustes.addView(mandoPuerta, anchoCompleto())
-
         val pistaPuerta = TextView(this)
-        pistaPuerta.text = "Si sube el pitido en los silencios, sube la puerta."
+        pistaPuerta.text = "La puerta aprende sola el ruido de la sala. " +
+            "El antiacople pone filtros en la frecuencia que pita, " +
+            "sin tocarte el volumen."
         pistaPuerta.setTextColor(TEXTO_TENUE)
         pistaPuerta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        pistaPuerta.setPadding(0, dp(8), 0, 0)
         tarjetaAjustes.addView(pistaPuerta)
 
         // Interruptores
@@ -355,13 +330,21 @@ class MainActivity : AppCompatActivity() {
         interruptorGraves = filaGraves.mando
         tarjetaAjustes.addView(filaGraves.fila, anchoCompleto(arriba = 8))
 
-        val filaSilencio = interruptor(
-            "Callar 1 s al acoplar",
-            "Corta del todo para romper el pitido y limpiar la sala.",
+        val filaPuertaSw = interruptor(
+            "Puerta de ruido",
+            "Aprende sola el ruido de la sala y lo deja fuera.",
             true
-        ) { activo -> motor.silenciarAlAcoplar = activo }
-        interruptorSilencio = filaSilencio.mando
-        tarjetaAjustes.addView(filaSilencio.fila, anchoCompleto(arriba = 8))
+        ) { activo -> motor.puertaActiva = activo }
+        interruptorPuerta = filaPuertaSw.mando
+        tarjetaAjustes.addView(filaPuertaSw.fila, anchoCompleto(arriba = 8))
+
+        val filaCompresor = interruptor(
+            "Compresor",
+            "Iguala la voz: no satura al levantarla ni se pierde al bajarla.",
+            true
+        ) { activo -> motor.compresor = activo }
+        interruptorCompresor = filaCompresor.mando
+        tarjetaAjustes.addView(filaCompresor.fila, anchoCompleto(arriba = 8))
 
         val filaPulsar = interruptor(
             "Modo pulsar para hablar",
@@ -402,9 +385,7 @@ class MainActivity : AppCompatActivity() {
 
         // Valores iniciales de las etiquetas
         valorGanancia.text = "x1.0"
-        valorPuerta.text = "30%"
         motor.ganancia = 1.0f
-        motor.umbralPuerta = 0.015f
 
         return raiz
     }
@@ -588,11 +569,14 @@ class MainActivity : AppCompatActivity() {
         anchoBarra(barraEntrada, e.nivelEntrada)
         anchoBarra(barraSalida, e.nivelSalida)
 
-        if (e.enSilencioPorAcople) {
-            avisoAcople.text = "🔇  Callado " + e.msSilencioRestante + " ms para cortar el acople"
-            avisoAcople.visibility = View.VISIBLE
-        } else if (e.acoplando) {
-            avisoAcople.text = "⚠  Acople detectado — bajando volumen"
+        if (e.notchesPuestos > 0) {
+            // Se dice la frecuencia porque es informacion util: si siempre
+            // pita en la misma, el problema es de colocacion del altavoz.
+            val hz = if (e.hzAcople > 0f) {
+                String.format(" · último %.0f Hz", e.hzAcople)
+            } else ""
+            avisoAcople.text = "🎚  " + e.notchesPuestos +
+                (if (e.notchesPuestos == 1) " filtro puesto" else " filtros puestos") + hz
             avisoAcople.visibility = View.VISIBLE
         } else {
             avisoAcople.visibility = View.GONE
@@ -601,17 +585,15 @@ class MainActivity : AppCompatActivity() {
         if (!motor.estaCorriendo()) return
 
         etiquetaEstado.text = when {
-            e.enSilencioPorAcople -> "Callado un momento para romper el acople"
             motor.modoPulsar && !motor.hablando -> "Listo — mantén pulsado para hablar"
-            e.acoplando -> String.format(
-                "Conteniendo acople — volumen al %.0f%%", e.reduccionAcople * 100f
+            e.reduccionCompresorDb > 6f -> String.format(
+                "Sonando · comprimiendo %.0f dB", e.reduccionCompresorDb
             )
             e.puertaAbierta -> "Sonando"
-            else -> "En silencio (puerta cerrada)"
+            else -> "En silencio (no se detecta voz)"
         }
         etiquetaEstado.setTextColor(
             when {
-                e.enSilencioPorAcople -> AVISO
                 e.acoplando -> AVISO
                 e.puertaAbierta -> LIMA
                 else -> TEXTO_TENUE
