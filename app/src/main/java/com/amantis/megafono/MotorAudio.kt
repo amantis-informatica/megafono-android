@@ -65,6 +65,24 @@ class MotorAudio(private val contexto: Context) {
     /** Filtro de graves: quita el retumbe, que es donde mas acopla. */
     @Volatile var filtroGraves: Boolean = true
 
+    /**
+     * Entrada y salida elegidas a mano. `null` = que decida Android
+     * (prefiriendo el microfono externo si lo hay).
+     *
+     * Se guarda el id, no el objeto: al desenchufar y volver a enchufar el
+     * lavalier, Android crea otro AudioDeviceInfo y el objeto viejo ya no
+     * vale para nada.
+     */
+    @Volatile var idEntradaElegida: Int? = null
+    @Volatile var idSalidaElegida: Int? = null
+
+    /** Una entrada o salida que el usuario puede elegir en la lista. */
+    data class Dispositivo(
+        val id: Int,
+        val nombre: String,
+        val esAutomatico: Boolean = false
+    )
+
     // --- Estado interno -----------------------------------------------------
 
     @Volatile private var corriendo = false
@@ -126,8 +144,7 @@ class MotorAudio(private val contexto: Context) {
         }
 
         // La fuente decide si Android nos da el cancelador de eco.
-        // VOICE_COMMUNICATION lo activa, pero en algunos moviles ignora el
-        // microfono USB y usa el interno. Por eso es un interruptor.
+        // VOICE_COMMUNICATION lo activa.
         val fuente = if (quiereAec) {
             MediaRecorder.AudioSource.VOICE_COMMUNICATION
         } else {
@@ -153,6 +170,17 @@ class MotorAudio(private val contexto: Context) {
             alFallar?.invoke("El microfono no arranco. Falta el permiso o lo tiene otra app.")
             liberar()
             return false
+        }
+
+        // Con VOICE_COMMUNICATION, Android tira del microfono interno por su
+        // cuenta y se salta el lavalier. Elegir la fuente NO elige el micro:
+        // hay que exigirlo aparte. Asi se queda el AEC Y el micro externo.
+        val idE = idEntradaElegida
+        grabador?.preferredDevice = if (idE == null) {
+            buscarMicrofonoExterno(audioManager)
+        } else {
+            audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+                .firstOrNull { it.id == idE }
         }
 
         val sesion = grabador!!.audioSessionId
@@ -190,6 +218,20 @@ class MotorAudio(private val contexto: Context) {
             return false
         }
 
+        val idS = idSalidaElegida
+        if (idS != null) {
+            reproductor?.preferredDevice = audioManager
+                .getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                .firstOrNull { it.id == idS }
+        }
+
+        corriendo = true
+        reproductor?.play()
+        grabador?.startRecording()
+
+        // El diagnostico se calcula DESPUES de arrancar: `routedDevice` no
+        // sabe por donde entra el sonido hasta que la grabacion esta en
+        // marcha, y antes devolvia null siempre.
         capacidades = Capacidades(
             aecDisponible = parAec.first,
             aecActivo = parAec.second,
@@ -200,10 +242,6 @@ class MotorAudio(private val contexto: Context) {
             nombreSalida = describirSalida(audioManager),
             frecuencia = frecuencia
         )
-
-        corriendo = true
-        reproductor?.play()
-        grabador?.startRecording()
 
         hiloAudio = thread(name = "megafono-audio", priority = Thread.MAX_PRIORITY) {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
@@ -391,51 +429,135 @@ class MotorAudio(private val contexto: Context) {
         }
     }
 
-    /** Nombre legible del microfono que se esta usando de verdad. */
-    private fun describirEntrada(am: AudioManager): String {
+    /** Entradas que el usuario puede elegir, con la opcion automatica delante. */
+    fun listarEntradas(): List<Dispositivo> {
+        val am = contexto.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val lista = mutableListOf(Dispositivo(-1, "Automático", esAutomatico = true))
+        for (d in am.getDevices(AudioManager.GET_DEVICES_INPUTS)) {
+            // Los virtuales solo confunden: no son microfonos de verdad.
+            if (d.type == AudioDeviceInfo.TYPE_TELEPHONY) continue
+            lista.add(Dispositivo(d.id, nombreDeDispositivo(d)))
+        }
+        return lista
+    }
+
+    /** Salidas que el usuario puede elegir. */
+    fun listarSalidas(): List<Dispositivo> {
+        val am = contexto.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val lista = mutableListOf(Dispositivo(-1, "Automático", esAutomatico = true))
+        for (d in am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+            if (d.type == AudioDeviceInfo.TYPE_TELEPHONY) continue
+            lista.add(Dispositivo(d.id, nombreDeSalida(d)))
+        }
+        return lista
+    }
+
+    /** Aplica la eleccion del usuario sin tener que parar el audio. */
+    fun aplicarDispositivosElegidos() {
+        val am = contexto.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+        val idE = idEntradaElegida
+        grabador?.preferredDevice = if (idE == null) {
+            buscarMicrofonoExterno(am)
+        } else {
+            am.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.id == idE }
+        }
+
+        val idS = idSalidaElegida
+        reproductor?.preferredDevice = if (idS == null) {
+            null
+        } else {
+            am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull { it.id == idS }
+        }
+
+        // Releer por donde va de verdad tras el cambio.
+        capacidades = capacidades.copy(
+            nombreEntrada = describirEntrada(am),
+            nombreSalida = describirSalida(am)
+        )
+    }
+
+    /**
+     * Busca un microfono enchufado por cable o USB, con preferencia por el USB.
+     *
+     * Devuelve null si solo esta el del propio movil: en ese caso no forzamos
+     * nada y dejamos que Android elija.
+     */
+    private fun buscarMicrofonoExterno(am: AudioManager): AudioDeviceInfo? {
         val dispositivos = am.getDevices(AudioManager.GET_DEVICES_INPUTS)
 
+        // Un lavalier USB-C se presenta como USB_HEADSET o USB_DEVICE segun
+        // el fabricante, asi que hay que mirar los dos.
         val usb = dispositivos.firstOrNull {
-            it.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
-                it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+            it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+        } ?: dispositivos.firstOrNull {
+            it.type == AudioDeviceInfo.TYPE_USB_DEVICE
         }
-        if (usb != null) return "Microfono USB-C (" + usb.productName + ")"
+        if (usb != null) return usb
 
-        val cable = dispositivos.firstOrNull {
+        return dispositivos.firstOrNull {
             it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET
         }
-        if (cable != null) return "Microfono de auriculares con cable"
+    }
 
-        val bt = dispositivos.firstOrNull {
-            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+    /**
+     * Nombre del microfono que se esta usando DE VERDAD.
+     *
+     * Se lo preguntamos al propio grabador (`routedDevice`), no a la lista de
+     * dispositivos disponibles: antes decia "USB-C" solo porque hubiera uno
+     * enchufado, aunque el sonido viniera del microfono interno.
+     */
+    private fun describirEntrada(am: AudioManager): String {
+        val real = try {
+            grabador?.routedDevice
+        } catch (e: Exception) {
+            null
         }
-        if (bt != null) return "Microfono Bluetooth (" + bt.productName + ")"
 
+        if (real != null) return nombreDeDispositivo(real)
+
+        // Si todavia no hay ruta asignada, decimos lo que hay, sin afirmar
+        // que se este usando.
+        val externo = buscarMicrofonoExterno(am)
+        if (externo != null) return nombreDeDispositivo(externo) + " (sin confirmar)"
         return "Microfono interno del movil"
     }
 
-    /** Nombre legible de donde va a salir el sonido. */
-    private fun describirSalida(am: AudioManager): String {
-        val dispositivos = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+    private fun nombreDeDispositivo(d: AudioDeviceInfo): String = when (d.type) {
+        AudioDeviceInfo.TYPE_USB_HEADSET,
+        AudioDeviceInfo.TYPE_USB_DEVICE -> "Microfono USB-C (" + d.productName + ")"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Microfono de auriculares con cable"
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Microfono Bluetooth (" + d.productName + ")"
+        AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Microfono interno del movil"
+        else -> "Entrada: " + d.productName
+    }
 
+    /** Por donde sale el sonido DE VERDAD, preguntandoselo al reproductor. */
+    private fun describirSalida(am: AudioManager): String {
+        val real = try {
+            reproductor?.routedDevice
+        } catch (e: Exception) {
+            null
+        }
+        if (real != null) return nombreDeSalida(real)
+
+        val dispositivos = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
         val a2dp = dispositivos.firstOrNull {
             it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
         }
-        if (a2dp != null) return "Altavoz Bluetooth (" + a2dp.productName + ")"
-
-        val usb = dispositivos.firstOrNull {
-            it.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
-                it.type == AudioDeviceInfo.TYPE_USB_HEADSET
-        }
-        if (usb != null) return "Salida USB-C (" + usb.productName + ")"
-
-        val cable = dispositivos.firstOrNull {
-            it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
-                it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET
-        }
-        if (cable != null) return "Auriculares con cable"
-
+        if (a2dp != null) return nombreDeSalida(a2dp) + " (sin confirmar)"
         return "Altavoz del movil"
+    }
+
+    private fun nombreDeSalida(d: AudioDeviceInfo): String = when (d.type) {
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "Altavoz Bluetooth (" + d.productName + ")"
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth manos libres (" + d.productName + ")"
+        AudioDeviceInfo.TYPE_USB_HEADSET,
+        AudioDeviceInfo.TYPE_USB_DEVICE -> "Salida USB-C (" + d.productName + ")"
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Auriculares con cable"
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "Altavoz del movil"
+        else -> "Salida: " + d.productName
     }
 
     private fun liberar() {

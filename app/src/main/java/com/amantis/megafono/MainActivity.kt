@@ -12,11 +12,14 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
+import android.widget.Spinner
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
@@ -38,6 +41,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var barraSalida: View
     private lateinit var etiquetaEstado: TextView
     private lateinit var etiquetaRuta: TextView
+    private lateinit var listaEntradas: Spinner
+    private lateinit var listaSalidas: Spinner
+
+    // Lo que hay ahora mismo en cada desplegable.
+    private var entradas: List<MotorAudio.Dispositivo> = emptyList()
+    private var salidas: List<MotorAudio.Dispositivo> = emptyList()
     private lateinit var etiquetaDiagnostico: TextView
     private lateinit var avisoAcople: TextView
 
@@ -82,8 +91,16 @@ class MainActivity : AppCompatActivity() {
         }
 
         setContentView(construirPantalla())
+        cargarDispositivos()
         pintarBoton(motor.estaCorriendo())
         if (motor.estaCorriendo()) mostrarDiagnostico()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // El lavalier se puede enchufar con la app ya abierta: al volver a
+        // la pantalla repasamos que hay conectado.
+        if (::listaEntradas.isInitialized) cargarDispositivos()
     }
 
     // ------------------------------------------------------------------------
@@ -167,15 +184,38 @@ class MainActivity : AppCompatActivity() {
         etiquetaEstado.setPadding(0, dp(12), 0, 0)
         tarjetaNiveles.addView(etiquetaEstado)
 
-        // --- Ruta de audio --------------------------------------------------
+        // --- Entrada y salida -----------------------------------------------
         val tarjetaRuta = tarjeta()
         col.addView(tarjetaRuta, anchoCompleto(arriba = 12))
-        tarjetaRuta.addView(rotulo("POR DÓNDE VA EL SONIDO"))
+        tarjetaRuta.addView(rotulo("ENTRADA Y SALIDA"))
+
+        tarjetaRuta.addView(etiquetaPequena("Micrófono"))
+        listaEntradas = Spinner(this)
+        tarjetaRuta.addView(listaEntradas, anchoCompleto(arriba = 4))
+
+        tarjetaRuta.addView(etiquetaPequena("Altavoz", arriba = 12))
+        listaSalidas = Spinner(this)
+        tarjetaRuta.addView(listaSalidas, anchoCompleto(arriba = 4))
+
+        val botonRefrescar = Button(this)
+        botonRefrescar.text = "Volver a buscar dispositivos"
+        botonRefrescar.isAllCaps = false
+        botonRefrescar.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+        botonRefrescar.setTextColor(LIMA)
+        val fondoRefrescar = GradientDrawable()
+        fondoRefrescar.cornerRadius = dp(10).toFloat()
+        fondoRefrescar.setColor(Color.TRANSPARENT)
+        fondoRefrescar.setStroke(dp(1), BORDE)
+        botonRefrescar.background = fondoRefrescar
+        botonRefrescar.setOnClickListener { cargarDispositivos() }
+        tarjetaRuta.addView(botonRefrescar, anchoCompleto(arriba = 10))
+
         etiquetaRuta = TextView(this)
-        etiquetaRuta.text = "Pulsa Empezar para verlo."
-        etiquetaRuta.setTextColor(TEXTO)
-        etiquetaRuta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+        etiquetaRuta.text = "Pulsa Empezar para ver por dónde va de verdad."
+        etiquetaRuta.setTextColor(TEXTO_SUAVE)
+        etiquetaRuta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
         etiquetaRuta.setLineSpacing(dp(4).toFloat(), 1f)
+        etiquetaRuta.setPadding(0, dp(12), 0, 0)
         tarjetaRuta.addView(etiquetaRuta)
 
         // --- Ajustes --------------------------------------------------------
@@ -247,7 +287,7 @@ class MainActivity : AppCompatActivity() {
         // Interruptores
         val filaAec = interruptor(
             "Cancelación de eco",
-            "Si el lavalier USB-C no suena, apágalo.",
+            "Déjala puesta. El micrófono se elige arriba.",
             true
         ) { activo ->
             motor.quiereAec = activo
@@ -310,6 +350,78 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ------------------------------------------------------------------------
+
+    /**
+     * Llena los dos desplegables con lo que hay enchufado ahora.
+     *
+     * Se vuelve a llamar al volver a la pantalla y con el boton de refrescar,
+     * porque el lavalier se puede enchufar con la app ya abierta.
+     */
+    private fun cargarDispositivos() {
+        entradas = motor.listarEntradas()
+        salidas = motor.listarSalidas()
+
+        montarLista(listaEntradas, entradas, motor.idEntradaElegida) { elegido ->
+            motor.idEntradaElegida = elegido
+            if (motor.estaCorriendo()) {
+                motor.aplicarDispositivosElegidos()
+                mostrarDiagnostico()
+            }
+        }
+
+        montarLista(listaSalidas, salidas, motor.idSalidaElegida) { elegido ->
+            motor.idSalidaElegida = elegido
+            if (motor.estaCorriendo()) {
+                motor.aplicarDispositivosElegidos()
+                mostrarDiagnostico()
+            }
+        }
+    }
+
+    private fun montarLista(
+        lista: Spinner,
+        opciones: List<MotorAudio.Dispositivo>,
+        idActual: Int?,
+        alElegir: (Int?) -> Unit
+    ) {
+        val nombres = opciones.map { it.nombre }
+        val adaptador = object : ArrayAdapter<String>(
+            this, android.R.layout.simple_spinner_item, nombres
+        ) {
+            override fun getView(pos: Int, convert: View?, padre: ViewGroup): View {
+                val v = super.getView(pos, convert, padre)
+                (v as? TextView)?.setTextColor(TEXTO)
+                (v as? TextView)?.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                return v
+            }
+        }
+        adaptador.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+
+        lista.onItemSelectedListener = null
+        lista.adapter = adaptador
+
+        val pos = opciones.indexOfFirst { d ->
+            if (idActual == null) d.esAutomatico else d.id == idActual
+        }
+        lista.setSelection(if (pos >= 0) pos else 0)
+
+        // Android APLAZA el aviso de setSelection() hasta el siguiente
+        // pintado, asi que llega cuando el oyente ya esta puesto otra vez.
+        // Quitar el oyente antes no basta: hay que ignorar ese primer aviso,
+        // o al abrir la app se pisa lo que el usuario tenia elegido.
+        var primerAviso = true
+        lista.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(p: AdapterView<*>?, v: View?, i: Int, id: Long) {
+                if (primerAviso) {
+                    primerAviso = false
+                    return
+                }
+                val d = opciones.getOrNull(i) ?: return
+                alElegir(if (d.esAutomatico) null else d.id)
+            }
+            override fun onNothingSelected(p: AdapterView<*>?) {}
+        }
+    }
 
     private fun alPulsarPrincipal() {
         if (motor.estaCorriendo()) {
