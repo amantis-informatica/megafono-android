@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Icono: un microfono en el lima de Amantis, con las dos antenas curvas
+  que la marca lleva en su mariposa. El area segura de un icono adaptativo
+  es el centro, asi que todo el dibujo se queda dentro de ese circulo.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Antena izquierda -->
+    <path
+        android:strokeColor="#A8C11D"
+        android:strokeWidth="2.6"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M50,38 C42,30 36,26 32,30" />
+
+    <!-- Antena derecha -->
+    <path
+        android:strokeColor="#A8C11D"
+        android:strokeWidth="2.6"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M58,38 C66,30 72,26 76,30" />
+
+    <!-- Capsula del microfono -->
+    <path
+        android:fillColor="#A8C11D"
+        android:pathData="M54,38 m-9,0 a9,9 0 1,0 18,0 l0,16 a9,9 0 1,1 -18,0 z" />
+
+    <!-- Arco que envuelve la capsula -->
+    <path
+        android:strokeColor="#8BA30F"
+        android:strokeWidth="3.4"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M38,52 C38,64 45,71 54,71 C63,71 70,64 70,52" />
+
+    <!-- Pie del microfono -->
+    <path
+        android:strokeColor="#8BA30F"
+        android:strokeWidth="3.4"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M54,71 L54,80" />
+
+    <!-- Base -->
+    <path
+        android:strokeColor="#8BA30F"
+        android:strokeWidth="3.4"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M44,80 L64,80" />
+</vector>

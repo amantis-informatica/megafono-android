@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Megafono" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">@color/amantis_lima</item>
+        <item name="colorOnPrimary">@color/fondo</item>
+        <item name="colorSecondary">@color/amantis_oliva</item>
+        <item name="android:colorBackground">@color/fondo</item>
+        <item name="android:navigationBarColor">@color/fondo</item>
+        <item name="android:statusBarColor">@color/fondo</item>
+        <item name="android:textColorPrimary">@color/texto</item>
+    </style>
+</resources>

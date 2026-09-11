@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Paleta Amantis Informatica, sacada de la web de la marca. -->
+    <color name="amantis_lima">#A8C11D</color>
+    <color name="amantis_lima_oscuro">#8BA30F</color>
+    <color name="amantis_oliva">#6B7C2E</color>
+
+    <color name="fondo">#0A0E00</color>
+    <color name="fondo_tarjeta">#151B08</color>
+    <color name="fondo_tarjeta_alt">#1E2610</color>
+    <color name="borde">#2C3618</color>
+
+    <color name="texto">#EEF1EC</color>
+    <color name="texto_suave">#9AA29A</color>
+    <color name="texto_tenue">#6F7560</color>
+
+    <color name="aviso">#FFC107</color>
+    <color name="peligro">#F87171</color>
+    <color name="correcto">#22C55E</color>
+</resources>
