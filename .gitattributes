@@ -1,0 +1,11 @@
+# gradlew lo ejecuta Linux en el CI: con finales CRLF revienta
+# con "bad interpreter". Se queda en LF pase lo que pase.
+gradlew text eol=lf
+*.sh text eol=lf
+
+# El wrapper es binario: que nadie lo toque.
+gradle/wrapper/gradle-wrapper.jar binary
+*.png binary
+*.apk binary
+
+gradlew.bat text eol=crlf

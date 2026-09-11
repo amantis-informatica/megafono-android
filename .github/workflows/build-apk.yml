@@ -1,0 +1,52 @@
+name: Compilar APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar el codigo
+        uses: actions/checkout@v4
+
+      - name: Preparar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Preparar el SDK de Android
+        uses: android-actions/setup-android@v3
+
+      - name: Cache de Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle.kts', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-
+
+      - name: Compilar
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Renombrar la APK
+        run: |
+          mkdir -p salida
+          cp app/build/outputs/apk/release/app-release.apk \
+             salida/MegafonoAmantis.apk
+          ls -la salida/
+
+      - name: Publicar la APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MegafonoAmantis-apk
+          path: salida/MegafonoAmantis.apk
+          # 14 dias: lo justo para descargarla sin acumular almacenamiento.
+          retention-days: 14
