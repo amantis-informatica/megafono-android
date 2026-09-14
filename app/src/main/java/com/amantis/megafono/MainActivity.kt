@@ -43,6 +43,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var barraSalida: View
     private lateinit var etiquetaEstado: TextView
     private lateinit var etiquetaRuta: TextView
+    private lateinit var etiquetaPreajuste: TextView
+    private lateinit var etiquetaCalibracion: TextView
     private lateinit var listaEntradas: Spinner
     private lateinit var listaSalidas: Spinner
 
@@ -106,6 +108,16 @@ class MainActivity : AppCompatActivity() {
         // el movil o al volver desde la notificacion. El cerrojo es esta marca.
         motor.alCambiarEstado = { e ->
             pantalla.post { if (vistasListas) pintarEstado(e) }
+        }
+        // El preajuste lo aplica el hilo de audio; cuando termina hay que
+        // repintar los mandos, porque ha cambiado varios de golpe.
+        motor.alAplicarPreajuste = {
+            pantalla.post {
+                if (vistasListas) {
+                    sincronizaMandos()
+                    avisar("Preajuste de megáfono portátil aplicado.")
+                }
+            }
         }
         motor.alFallar = { msg ->
             pantalla.post {
@@ -289,6 +301,43 @@ class MainActivity : AppCompatActivity() {
         tarjetaAjustes.addView(rotulo("AJUSTES"))
 
         // ====================================================================
+        // PREAJUSTE: un boton que deja todo puesto para el caso real.
+        //
+        // El usuario de esto lleva el altavoz en bandolera y el movil en la
+        // mano, y no tiene por que entender ocho mandos. El boton deja la
+        // cadena con lo que de verdad funciona en ese escenario, medido:
+        // notches, paso alto, puerta agresiva y compresor; AEC y filtro de voz
+        // APAGADOS porque se midio que no aportan en lazo cerrado.
+        // ====================================================================
+        val botonPreajuste = Button(this)
+        botonPreajuste.text = "Preajuste: megáfono portátil"
+        botonPreajuste.isAllCaps = false
+        botonPreajuste.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        botonPreajuste.setTextColor(FONDO)
+        val fondoPre = GradientDrawable()
+        fondoPre.cornerRadius = dp(10).toFloat()
+        fondoPre.setColor(LIMA)
+        botonPreajuste.background = fondoPre
+        botonPreajuste.setOnClickListener {
+            if (!motor.estaCorriendo()) {
+                avisar("Pulsa Empezar antes de aplicar el preajuste.")
+            } else {
+                motor.pidePreajustePortatil = true
+            }
+        }
+        tarjetaAjustes.addView(botonPreajuste, anchoCompleto(arriba = 2))
+
+        etiquetaPreajuste = TextView(this)
+        etiquetaPreajuste.text =
+            "Altavoz en bandolera, micrófono de solapa y el móvil en la mano. " +
+            "Deja puestos los filtros que sirven en ese caso."
+        etiquetaPreajuste.setTextColor(TEXTO_SUAVE)
+        etiquetaPreajuste.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        etiquetaPreajuste.setLineSpacing(dp(3).toFloat(), 1f)
+        etiquetaPreajuste.setPadding(0, dp(6), 0, dp(4))
+        tarjetaAjustes.addView(etiquetaPreajuste)
+
+        // ====================================================================
         // La tarjeta va ORDENADA POR PROBLEMA, no por bloque tecnico.
         //
         // El usuario no llega aqui pensando "quiero un notch de 1/3 de octava";
@@ -309,7 +358,42 @@ class MainActivity : AppCompatActivity() {
             false
         ) { activo -> motor.cancelarEco = activo }
         interruptorEco = filaEco.mando
-        tarjetaAjustes.addView(filaEco.fila, anchoCompleto())
+        tarjetaAjustes.addView(filaEco.fila, anchoCompleto(arriba = 8))
+
+        // --- Boton de CALIBRAR -------------------------------------------
+        //
+        // Mide el retardo real del camino altavoz -> aire -> microfono
+        // emitiendo una rafaga corta de ruido. Es lo unico que permite alinear
+        // el cancelador de eco en un megafono: con el lazo cerrado, la
+        // estimacion automatica no puede ver ese retardo (la referencia es la
+        // propia voz del usuario). Ver [CalibradorEco].
+        val botonCalibrar = Button(this)
+        botonCalibrar.text = "Calibrar el eco (2 s, no hables)"
+        botonCalibrar.isAllCaps = false
+        botonCalibrar.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+        botonCalibrar.setTextColor(LIMA)
+        val fondoCal = GradientDrawable()
+        fondoCal.cornerRadius = dp(10).toFloat()
+        fondoCal.setColor(Color.TRANSPARENT)
+        fondoCal.setStroke(dp(1), BORDE)
+        botonCalibrar.background = fondoCal
+        botonCalibrar.setOnClickListener {
+            if (!motor.estaCorriendo()) {
+                avisar("Pulsa Empezar antes de calibrar.")
+            } else {
+                motor.pideCalibrar = true
+            }
+        }
+        tarjetaAjustes.addView(botonCalibrar, anchoCompleto(arriba = 8))
+
+        etiquetaCalibracion = TextView(this)
+        etiquetaCalibracion.text =
+            "Sin calibrar. Durante la calibración sale un siseo corto por el altavoz: no hables."
+        etiquetaCalibracion.setTextColor(TEXTO_SUAVE)
+        etiquetaCalibracion.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        etiquetaCalibracion.setLineSpacing(dp(3).toFloat(), 1f)
+        etiquetaCalibracion.setPadding(0, dp(6), 0, 0)
+        tarjetaAjustes.addView(etiquetaCalibracion)
 
         val pistaEco = TextView(this)
         pistaEco.text = "Funciona cuando lo que sale por el altavoz NO es tu " +
@@ -751,6 +835,28 @@ class MainActivity : AppCompatActivity() {
         anchoBarra(barraEntrada, e.nivelEntrada)
         anchoBarra(barraSalida, e.nivelSalida)
 
+        // --- Calibracion del eco ---
+        if (e.calibrando) {
+            etiquetaCalibracion.text = String.format(
+                "Calibrando… %d%%  —  no hables", (e.calibracionProgreso * 100).toInt()
+            )
+            etiquetaCalibracion.setTextColor(AVISO)
+        } else if (e.calibracionRetardoMs >= 0f) {
+            // La calidad dice si fiarse: si salio baja, normalmente es que el
+            // altavoz estaba mudo o el volumen muy bajo.
+            if (e.calibracionCalidad >= 0.3f) {
+                etiquetaCalibracion.text = String.format(
+                    "Calibrado: el sonido tarda %.0f ms en volver (medida buena).",
+                    e.calibracionRetardoMs
+                )
+                etiquetaCalibracion.setTextColor(LIMA)
+            } else {
+                etiquetaCalibracion.text =
+                    "Calibración poco clara. Sube el volumen del altavoz y repite."
+                etiquetaCalibracion.setTextColor(AVISO)
+            }
+        }
+
         // El micro entrando recortado es LA causa de que suene mal, y no lo
         // arregla nada de la cadena. Se avisa antes que cualquier otra cosa.
         if (e.picoCrudo > 0.97f) {
@@ -1006,6 +1112,40 @@ class MainActivity : AppCompatActivity() {
         t.letterSpacing = 0.12f
         t.setPadding(0, dp(arriba), 0, dp(6))
         return t
+    }
+
+    /**
+     * Vuelve a pintar los mandos con lo que hay ahora en el motor.
+     *
+     * Hace falta despues del preajuste: como cambia media docena de ajustes de
+     * una vez, si no se repintan los interruptores se quedarian ensenando lo
+     * de antes y el usuario no sabria que le han cambiado.
+     *
+     * OJO: los interruptores llevan un `setOnCheckedChangeListener` que
+     * escribe en el motor. Si se les cambia el estado con el oyente puesto, se
+     * dispara y vuelve a escribir lo mismo; peor aun, en algunos casos
+     * reentraria. Por eso se quita el oyente, se pone el valor y se vuelve a
+     * poner.
+     */
+    private fun sincronizaMandos() {
+        ponSinAvisar(interruptorEco, motor.cancelarEco) { motor.cancelarEco = it }
+        ponSinAvisar(interruptorVoz, motor.filtroVoz) { motor.filtroVoz = it }
+        ponSinAvisar(interruptorAntiacople, motor.antiacople) { motor.antiacople = it }
+        ponSinAvisar(interruptorGraves, motor.filtroGraves) { motor.filtroGraves = it }
+        ponSinAvisar(interruptorPuerta, motor.puertaActiva) { motor.puertaActiva = it }
+        ponSinAvisar(interruptorCompresor, motor.compresor) { motor.compresor = it }
+    }
+
+    /** Cambia un interruptor sin que salte su propio oyente. */
+    private fun ponSinAvisar(sw: Switch, valor: Boolean, alCambiar: (Boolean) -> Unit) {
+        sw.setOnCheckedChangeListener(null)
+        sw.isChecked = valor
+        sw.setOnCheckedChangeListener { _, v -> alCambiar(v) }
+    }
+
+    /** Un aviso corto al usuario. */
+    private fun avisar(texto: String) {
+        Toast.makeText(this, texto, Toast.LENGTH_SHORT).show()
     }
 
     private fun rotulo(texto: String): TextView {

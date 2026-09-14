@@ -54,7 +54,15 @@ class MotorAudio(private val contexto: Context) {
         /** 0..1, cuanta estructura de voz ve el filtro de voz. */
         val probabilidadVoz: Float = 0f,
         /** Tono fundamental de la voz detectado, en Hz. -1 si no hay. */
-        val tonoVozHz: Float = -1f
+        val tonoVozHz: Float = -1f,
+        /** Si la calibracion esta en marcha ahora mismo. */
+        val calibrando: Boolean = false,
+        /** Progreso de la calibracion, 0..1. */
+        val calibracionProgreso: Float = 0f,
+        /** Retardo que midio la ultima calibracion, en ms. -1 si no hay. */
+        val calibracionRetardoMs: Float = -1f,
+        /** Lo clara que salio la ultima calibracion, 0..1. */
+        val calibracionCalidad: Float = 0f
     )
 
     /** Lo que se pudo activar de verdad en ESTE movil. */
@@ -133,6 +141,29 @@ class MotorAudio(private val contexto: Context) {
 
     /** Compresor: iguala la voz para que no sature al levantar la voz. */
     @Volatile var compresor: Boolean = true
+
+    /**
+     * Peticion de CALIBRAR el camino de eco.
+     *
+     * La pantalla la pone a true; el hilo de audio la ve, arranca la
+     * calibracion y la vuelve a poner a false. Se hace asi y no llamando
+     * directamente a la cadena porque la cadena vive en el hilo de audio y no
+     * se toca desde fuera.
+     */
+    @Volatile var pideCalibrar: Boolean = false
+
+    /**
+     * Peticion de aplicar el PREAJUSTE de megafono portatil.
+     *
+     * Igual que la anterior: la pantalla pide, el hilo de audio obedece. Al
+     * aplicarlo hay que copiar los valores de vuelta a los campos de este
+     * motor, porque si no la pantalla y la cadena quedarian diciendo cosas
+     * distintas.
+     */
+    @Volatile var pidePreajustePortatil: Boolean = false
+
+    /** Avisa a la pantalla de que el preajuste ya esta puesto. */
+    @Volatile var alAplicarPreajuste: (() -> Unit)? = null
 
     /** Puerta de ruido con umbral que se aprende solo. */
     @Volatile var puertaActiva: Boolean = true
@@ -407,6 +438,36 @@ class MotorAudio(private val contexto: Context) {
             // contra el acople, puerta adaptativa, compresor y limitador.
             // Aqui solo se le pasan los ajustes y se le da el bloque.
             val c = cadena ?: continue
+
+            // PREAJUSTE Y CALIBRACION, antes de pasarle los ajustes sueltos.
+            //
+            // El preajuste va PRIMERO porque cambia varios campos de este
+            // motor de golpe; si fuera despues, las lineas de abajo
+            // machacarian lo que acaba de poner.
+            if (pidePreajustePortatil) {
+                pidePreajustePortatil = false
+                c.preajustePortatil()
+                // Los valores que ha puesto la cadena se copian de vuelta a
+                // este motor, que es lo que lee la pantalla. Sin esto los
+                // mandos seguirian mostrando lo de antes y en el siguiente
+                // bloque volverian a imponerlo.
+                cancelarEco = c.aecActivo
+                filtroVoz = c.filtroVozActivo
+                antiacople = c.notchesActivos
+                filtroGraves = c.pasoAltoActivo
+                puertaActiva = c.puertaActiva
+                compresor = c.compresorActivo
+                msDecorrelacion = c.msDecorrelacion
+                hzDesplazamiento = c.hzDesplazamiento
+                gananciaEntrada = c.gananciaEntrada
+                ganancia = c.ganancia
+                alAplicarPreajuste?.invoke()
+            }
+            if (pideCalibrar) {
+                pideCalibrar = false
+                c.calibra()
+            }
+
             c.pasoAltoActivo = filtroGraves
             c.notchesActivos = antiacople
             c.aecActivo = cancelarEco
@@ -427,7 +488,10 @@ class MotorAudio(private val contexto: Context) {
 
             // Avisar a la pantalla ~10 veces por segundo, no en cada bloque.
             contadorAvisos++
-            if (contadorAvisos >= 10) {
+            // Mientras calibra se avisa en CADA bloque: la calibracion dura
+            // menos de un segundo y con un aviso cada 10 bloques la barra de
+            // progreso daria dos saltos y se acabaria.
+            if (contadorAvisos >= 10 || c.calibrando) {
                 contadorAvisos = 0
                 estado = Estado(
                     nivelEntrada = c.picoEntrada,
@@ -445,7 +509,11 @@ class MotorAudio(private val contexto: Context) {
                     erleDb = c.erleAec,
                     retardoEcoMs = c.retardoEcoMs,
                     probabilidadVoz = c.probabilidadVoz,
-                    tonoVozHz = c.tonoVozHz
+                    tonoVozHz = c.tonoVozHz,
+                    calibrando = c.calibrando,
+                    calibracionProgreso = c.calibracionProgreso,
+                    calibracionRetardoMs = c.calibracionRetardoMs,
+                    calibracionCalidad = c.calibracionCalidad
                 )
                 alCambiarEstado?.invoke(estado)
             }

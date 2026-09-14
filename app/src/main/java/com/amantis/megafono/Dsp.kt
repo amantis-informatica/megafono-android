@@ -1202,8 +1202,15 @@ class CadenaAntiacople(private val fs: Int) {
     private val limitador = Limitador(fs, msAnticipacion = 5f)
     private val decorrelacion = RetardoDecorrelacion(fs, msMaximos = 40f)
     private val desplazador = DesplazadorFrecuencia(fs, taps = 101)
-    private val aec = CanceladorEco(fs)
+    // Cola de 50 ms, no de 200. En un megafono portatil el camino acustico es
+    // CORTO (3 ms de vuelo a 1 m mas la cola del cuerpo y la ropa, que se
+    // apaga en 20-30 ms); los 150-250 ms del Bluetooth son un retardo PURO que
+    // resuelve la alineacion, no algo que el filtro tenga que modelar. Un
+    // filtro corto converge mucho mas rapido y con menos ruido de gradiente,
+    // y ademas cuesta 4 veces menos.
+    private val aec = CanceladorEco(fs, msCola = 50f)
     private val filtroVoz = FiltroVoz(fs)
+    private val calibrador = CalibradorEco(fs)
 
     // --- Medidas para la pantalla ------------------------------------------
     @Volatile var picoEntrada = 0f; private set
@@ -1291,6 +1298,137 @@ class CadenaAntiacople(private val fs: Int) {
     /** Suelta todos los notches (boton "reiniciar antiacople"). */
     fun soltarNotches() = notches.reiniciar()
 
+    // --- CALIBRACION DEL CAMINO DE ECO --------------------------------------
+
+    /**
+     * Si la calibracion esta en marcha. Mientras lo este, por el altavoz sale
+     * la senal de prueba y NO la voz: el usuario tiene que callarse.
+     */
+    @Volatile var calibrando = false; private set
+
+    /** Progreso de la calibracion, 0..1, para pintar una barra. */
+    val calibracionProgreso: Float get() = calibrador.progreso
+
+    /** Retardo que midio la ultima calibracion, en ms. -1 si no hay. */
+    @Volatile var calibracionRetardoMs = -1f; private set
+
+    /** Lo clara que salio la ultima calibracion, 0..1. */
+    @Volatile var calibracionCalidad = 0f; private set
+
+    /**
+     * Arranca la calibracion: 1-2 segundos emitiendo una rafaga de ruido para
+     * medir el retardo real del camino altavoz -> aire -> microfono.
+     *
+     * Se llama desde la pantalla (boton "Calibrar"). El trabajo lo hace el
+     * hilo de audio dentro de [procesa].
+     */
+    fun calibra() {
+        calibrador.arranca()
+        calibracionRetardoMs = -1f
+        calibracionCalidad = 0f
+        calibrando = true
+    }
+
+    /**
+     * PREAJUSTE "MEGAFONO PORTATIL".
+     *
+     * Deja la cadena lista para el escenario real de una vez, para que el
+     * usuario no tenga que entender ocho mandos. Cada valor tiene su motivo:
+     *
+     *  - AEC APAGADO. Medido en este mismo escenario: 30-33 dB en lazo
+     *    abierto pero solo 0,3-1,5 dB en el lazo cerrado de un megafono, con
+     *    la calibracion puesta y el filtro congelado. Ver el cuerpo del
+     *    metodo. El interruptor sigue a la vista para el uso de manos libres.
+     *  - CONGELACION PREPARADA, por si se enciende el AEC a mano: con esta
+     *    geometria es lo correcto, porque el camino no cambia.
+     *  - NOTCHES ENCENDIDOS. Siguen siendo lo unico que mata el PITIDO.
+     *  - FILTRO DE VOZ APAGADO. Se midio y EMPEORA el ruido de trafico
+     *    (-10,65 -> -4,70 dB): el paso alto ya se lo habia llevado. Ver el
+     *    cuerpo del metodo.
+     *  - PUERTA ENCENDIDA Y AGRESIVA (margen 18 dB). Con el lavalier a 10 cm
+     *    de la boca la voz entra muy por encima de la calle, asi que subir el
+     *    margen quita mas ruido y apenas toca la voz.
+     *  - DECORRELACION Y DESPLAZAMIENTO APAGADOS. Con el AEC funcionando
+     *    sobran, y los dos tienen un precio: el retardo suma latencia al lazo
+     *    y el desplazamiento desafina la voz. Ver [preajustePortatil] en el
+     *    informe: medidos, no aportan con el AEC puesto.
+     *  - GANANCIAS SENSATAS. Entrada a 1,0 (el lavalier ya entra fuerte a
+     *    10 cm) y salida a 2,0, que con el compresor y el limitador detras da
+     *    volumen de sobra sin acercarse al recorte.
+     */
+    fun preajustePortatil() {
+        // EL AEC SE QUEDA APAGADO, y hay que explicarlo porque es lo contrario
+        // de lo que parece que deberia salir del cambio de escenario.
+        //
+        // Se remidio todo con la geometria del megafono portatil (camino
+        // corto, cola de 25 ms, microfono en el lobulo trasero, retardo del
+        // Bluetooth de 200 ms) y con TODOS los arreglos puestos: cola del
+        // filtro de 50 ms, calibracion que clava el retardo con 0,4 ms de
+        // error, y congelacion al converger. Resultado:
+        //
+        //   - LAZO ABIERTO (referencia ajena): 30-33 dB. Muy bien.
+        //   - LAZO CERRADO (megafono de verdad): entre 0,3 y 1,5 dB, y da
+        //     igual el ajuste. Se probo con caminos de -17, -10 y -6 dB y con
+        //     ganancias x2 y x4: la mejora nunca paso de 1,5 dB.
+        //
+        // La razon es la de siempre y no la arregla ninguna geometria: en un
+        // megafono la referencia ES la voz del usuario amplificada, asi que
+        // "cancelar el eco" y "cancelar la voz" son el mismo problema para el
+        // filtro. La geometria fija ayudaba a CONVERGER, que era la hipotesis,
+        // y efectivamente converge; lo que no puede es distinguir que parte
+        // del microfono hay que quitar.
+        //
+        // Encenderlo por defecto seria gastar bateria y CPU para 1 dB, con el
+        // riesgo de que en un movil real (donde el altavoz distorsiona y la
+        // referencia no es exacta) haga mas mal que bien. Se deja el
+        // interruptor a la vista para quien use el movil como manos libres,
+        // que es donde si da sus 30 dB.
+        aecActivo = false
+        // Si alguien lo enciende a mano, que lo haga con la congelacion
+        // puesta: es lo correcto para esta geometria.
+        aec.congelaSiConverge = true
+        notchesActivos = true
+        // FILTRO DE VOZ APAGADO, y va contra lo que parecia obvio.
+        //
+        // La idea era que en la calle (trafico, gente) tenia que ayudar. Se
+        // midio con la persona andando, lavalier a 10 cm y ruido a -34 dB de
+        // la voz, comparando el ruido que sale en los SILENCIOS entre frases:
+        //
+        //   ruido de TRAFICO (grave):     sin el -10,65 dB | con el -4,70 dB
+        //   ruido de BANDA ANCHA (gente): sin el  -5,16 dB | con el -5,77 dB
+        //
+        // O sea: con ruido de trafico lo EMPEORA casi 6 dB, y con ruido de
+        // banda ancha lo mejora medio dB escaso. Y en los dos casos se come
+        // algo mas de voz (de -0,85 a -1,3 dB).
+        //
+        // La razon es que el paso alto de 120 Hz ya se ha llevado el retumbe
+        // del trafico, que es donde estaba casi toda la energia; lo que el
+        // filtro de voz anade encima son artefactos de reconstruccion en la
+        // banda que queda. Sigue estando el interruptor para quien tenga un
+        // ruido de fondo muy de banda ancha, pero por defecto no.
+        filtroVozActivo = false
+        pasoAltoActivo = true
+        puertaActiva = true
+        compresorActivo = true
+        // Con el AEC puesto, estas dos no aportan y si cuestan.
+        msDecorrelacion = 0f
+        hzDesplazamiento = 0f
+        gananciaEntrada = 1f
+        ganancia = 2f
+        // La puerta puede ser mas agresiva: el lavalier esta a 10 cm de la
+        // boca, asi que la voz entra muy por encima de la calle y subir el
+        // margen no se come la voz.
+        //
+        // Medido con ruido de banda ancha, el ruido que sale en los silencios:
+        //   margen 12 dB -> -6,51 dB (voz -0,85)
+        //   margen 15 dB -> -6,75 dB (voz -0,89)
+        //   margen 18 dB -> -7,08 dB (voz -1,03)
+        // Se coge 18: es el que mas ruido quita y la voz solo pierde 0,2 dB
+        // respecto a 12, que no se oye.
+        puerta.margenAperturaDb = 18f
+        puerta.recalcula()
+    }
+
     /**
      * Retardo que anade la cadena, en milisegundos.
      *
@@ -1330,6 +1468,38 @@ class CadenaAntiacople(private val fs: Int) {
         // NaN, toda comparacion da false y la puerta se queda cerrada para
         // siempre. Se sale antes de tocar nada.
         if (muestras <= 0) return
+
+        // --- CALIBRACION -----------------------------------------------------
+        //
+        // Mientras dura, la cadena NO procesa voz: por el altavoz sale la
+        // rafaga de prueba y lo unico que se hace con el microfono es
+        // guardarlo para correlarlo. Se sale antes de tocar nada mas.
+        //
+        // Va lo PRIMERO de todo a proposito: si la voz del usuario se colara
+        // en la salida durante la calibracion, esa voz volveria por el camino
+        // acustico y ensuciaria la correlacion, que es justo lo que la
+        // calibracion viene a evitar.
+        if (calibrando) {
+            for (i in 0 until muestras) {
+                val micro = bloque[i] * (1f / 32768f)
+                val v = calibrador.siguienteMuestra(micro)
+                bloque[i] = (v * 32767f).toInt().toShort()
+                // La referencia del AEC tiene que llevar TAMBIEN la rafaga:
+                // es lo que de verdad esta saliendo por el altavoz.
+                aec.empujaReferencia(v)
+            }
+            if (calibrador.terminado) {
+                calibrando = false
+                calibracionCalidad = calibrador.calidad
+                calibracionRetardoMs = calibrador.retardoMs
+                // Solo se le pasa al AEC si la medida es de fiar. Si no lo es
+                // (altavoz mudo, volumen al minimo, ruido enorme), se deja el
+                // AEC como estaba: un retardo inventado es peor que ninguno.
+                val ret = calibrador.retardoMuestras
+                if (ret >= 0) aec.fijaRetardo(ret)
+            }
+            return
+        }
 
         var pico = 0f
         var picoCrudo = 0f
@@ -1499,7 +1669,21 @@ class CadenaAntiacople(private val fs: Int) {
     // --- Ajustes finos del AEC y del filtro de voz, para quien los quiera ---
     fun aecPaso(v: Float) { aec.mu = v }
     fun aecNlp(activo: Boolean) { aec.nlpActivo = activo }
+
+    /** Fija el retardo del AEC a mano (lo usa la calibracion y las pruebas). */
+    fun aecFijaRetardo(muestras: Int) = aec.fijaRetardo(muestras)
+
+    /** Congelar el filtro del AEC cuando converja (geometria fija). */
+    fun aecCongela(activo: Boolean) { aec.congelaSiConverge = activo }
+
+    /** Si el filtro del AEC esta congelado ahora mismo. */
+    fun aecCongelado(): Boolean = aec.filtroCongelado
+    fun aecDivergencias(): Int = aec.divergencias
+    fun aecNorma(): Float = aec.normaPesos()
     fun filtroVozAtenuacionDb(v: Float) { filtroVoz.atenuacionMaximaDb = v }
+
+    /** Margen de apertura de la puerta, en dB sobre el ruido medido. */
+    fun puertaMargenDb(v: Float) { puerta.margenAperturaDb = v; puerta.recalcula() }
     fun filtroVozUmbral(v: Float) { filtroVoz.umbralVoz = v }
 }
 
@@ -2340,6 +2524,86 @@ class CanceladorEco(
     /** Supresor no lineal del residuo (NLP). */
     @Volatile var nlpActivo = true
 
+    // --- CONGELACION DEL FILTRO (geometria fija) ----------------------------
+    //
+    // ESTO SOLO TIENE SENTIDO EN UN MEGAFONO PORTATIL, y conviene explicar por
+    // que, porque en megafonia de sala seria un disparate.
+    //
+    // En sala el camino acustico cambia sin parar: la gente se mueve, las
+    // reflexiones bailan. Congelar el filtro ahi significa quedarse con un
+    // modelo caducado, asi que hay que readaptar siempre.
+    //
+    // En un megafono de bandolera la geometria es CASI FIJA: el altavoz y el
+    // microfono se mueven JUNTOS, siempre a ~1 m, con el microfono en el
+    // lobulo trasero del cono. El camino real cambia poquisimo (el balanceo al
+    // andar, y poco mas). Ahi seguir readaptando no aporta nada y si tiene un
+    // coste serio: en lazo cerrado la referencia ES la voz del usuario, asi
+    // que cada actualizacion arrastra un sesgo que tira los pesos hacia
+    // cancelar la voz en vez de solo el eco. Cuanto mas tiempo adapta, mas se
+    // desvia.
+    //
+    // Congelar cuando ha convergido corta ese sesgo de raiz: se aprende el
+    // camino cuando las condiciones son buenas y luego se deja quieto.
+    @Volatile var congelaSiConverge = false
+
+    /**
+     * ERLE (dB) a partir del cual se considera que ha convergido.
+     *
+     * 22 dB y no 9, y esto se midio. Con el umbral en 9 dB el filtro congelaba
+     * A MEDIA CONVERGENCIA: las curvas de ERLE por medio segundo con cola de
+     * 40-60 ms pasan por 9-10 dB a los 2,5 s pero no se asientan en 30+ dB
+     * hasta los 5-6 s. Congelando en 9 dB el resultado final caia a 16,6 dB,
+     * o sea que la congelacion EMPEORABA las cosas (sin congelar: 30,2 dB).
+     *
+     * El umbral tiene que estar donde el filtro ya esta bueno de verdad, no
+     * donde empieza a funcionar.
+     */
+    @Volatile var erleParaCongelar = 22f
+
+    /**
+     * Cuantos bloques seguidos tiene que estar el ERLE por encima del umbral
+     * antes de congelar. 800 bloques son ~4,3 s.
+     *
+     * Es mucho a proposito: la voz tiene silencios, y durante un silencio el
+     * ERLE medido no significa nada. Exigir que se mantenga alto durante
+     * varios segundos asegura que se ha visto al filtro trabajar con voz de
+     * verdad y no solo en un hueco tranquilo.
+     */
+    @Volatile var bloquesParaCongelar = 800
+
+    /**
+     * Si el ERLE cae por debajo de esto estando congelado, se DESCONGELA: la
+     * geometria ha cambiado de verdad (se ha descolgado la bandolera, ha
+     * cambiado de mano el movil) y hay que volver a aprender.
+     *
+     * Va bastante por debajo del umbral de congelar para que no haya un
+     * pingpong congela/descongela con las variaciones normales del andar.
+     */
+    @Volatile var erleParaDescongelar = 10f
+
+    /** Bloques seguidos de ERLE malo antes de descongelar (~1 s). */
+    @Volatile var bloquesParaDescongelar = 200
+
+    /** Si el filtro esta congelado ahora mismo. Solo para la pantalla. */
+    @Volatile var filtroCongelado = false; private set
+
+    /**
+     * Norma maxima que se le consiente a los pesos antes de darlos por
+     * divergidos. Ver la guardia del apartado h2.
+     */
+    @Volatile var limiteNorma = 8f
+
+    /**
+     * Cuantas veces ha habido que tirar los pesos por divergencia. Si esto
+     * sube sin parar es que el paso [mu] es demasiado grande para el lazo que
+     * hay montado, o que el volumen de salida esta tan alto que el sistema no
+     * es estable de ninguna manera.
+     */
+    @Volatile var divergencias = 0; private set
+
+    private var bloquesBuenos = 0
+    private var bloquesMalos = 0
+
     /**
      * Cuanto puede atenuar el NLP como mucho, en dB (negativo). -18 dB basta
      * para enterrar el residuo bajo el ruido de sala sin que se note el
@@ -2415,8 +2679,148 @@ class CanceladorEco(
         dobleHabla = false
         retardoAplicado = 0
         retardoAnterior = -1
+        filtroCongelado = false
+        bloquesBuenos = 0
+        bloquesMalos = 0
+        retardoFijado = false
+        retardoPendiente = -1
+        divergencias = 0
         estimador.reiniciar()
     }
+
+    /**
+     * Fija el retardo A MANO, con el valor que ha medido la CALIBRACION.
+     *
+     * Es la pieza que hace util al AEC en un megafono. El estimador por
+     * correlacion de envolventes no puede ver el retardo en lazo cerrado
+     * (la referencia ES la voz del usuario, asi que la correlacion solo dice
+     * "se parecen a desfase cero"), y sin alineacion el eco cae fuera de la
+     * ventana del filtro y no se cancela NADA. La calibracion resuelve eso
+     * midiendo con una senal que el usuario no esta generando.
+     *
+     * Cuando el retardo viene de aqui, el estimador automatico deja de tocar
+     * la alineacion: lo medido en silencio con una senal conocida es mejor
+     * dato que lo que pueda adivinar en lazo cerrado.
+     */
+    /**
+     * Retardo que la calibracion quiere aplicar pero que todavia no se puede
+     * aplicar. Ver [fijaRetardo]. -1 = no hay nada pendiente.
+     */
+    private var retardoPendiente = -1
+
+    fun fijaRetardo(muestrasRetardo: Int) {
+        // NO SE PUEDE ALINEAR CON EL BUFFER DE REFERENCIA VACIO.
+        //
+        // La calibracion acaba justo cuando termina la rafaga, y en ese
+        // momento el buffer de referencia lleva dentro la rafaga y poco mas:
+        // `potBin` todavia no se ha aprendido y el historial de espectros esta
+        // a ceros. Si se alinea ahi, el primer bloque normaliza el paso contra
+        // una potencia que no significa nada y el filtro sale disparado.
+        //
+        // Medido con referencia ajena y camino portatil: fijando el retardo en
+        // t=0 salian 0,00 dB y 3.852 divergencias; el MISMO valor aplicado en
+        // t=1 s daba 32,40 dB y cero divergencias.
+        //
+        // Asi que si aun no hay referencia suficiente, el retardo se guarda y
+        // se aplica en cuanto la haya. `refTotal` cuenta las muestras de
+        // referencia empujadas desde el arranque; con un par de colas enteras
+        // del filtro ya hay material de sobra.
+        val minimo = (p * b * 2).coerceAtLeast(2 * fs / 10)
+        if (refTotal < minimo) {
+            retardoPendiente = muestrasRetardo
+            // Se apunta ya para la pantalla, aunque no este aplicado todavia.
+            retardoMs = muestrasRetardo * 1000f / fs
+            retardoFijado = true
+            return
+        }
+        aplicaRetardo(muestrasRetardo)
+    }
+
+    private fun aplicaRetardo(muestrasRetardo: Int) {
+        // EL MARGEN DE SEGURIDAD, Y POR QUE AQUI ES DISTINTO QUE EN EL
+        // ESTIMADOR AUTOMATICO.
+        //
+        // El estimador por envolventes se resta un bloque entero (`est - b`)
+        // porque su resolucion es de 128 muestras y su pico baila: mas vale
+        // que el filtro cubra un poco de mas por delante a que el eco caiga
+        // ANTES del principio de su ventana, que eso no lo puede arreglar.
+        //
+        // La calibracion NO necesita ese margen tan grande: mide la forma de
+        // onda, con resolucion de UNA muestra y un error medido de 0,4 ms. Si
+        // se le resta un bloque entero (5,3 ms) se esta desalineando a
+        // proposito una medida que era buena.
+        //
+        // Medido, y es la diferencia entre que funcione y que no: con el
+        // camino portatil y la referencia ajena (lazo abierto), el mismo AEC
+        // daba 30,41 dB dejando estimar solo y 0,00 dB con 3.949 divergencias
+        // cuando se le fijaba el retardo restandole el bloque. El filtro se
+        // quedaba modelando un eco que le llegaba antes de su ventana.
+        //
+        // Se deja un margen de un cuarto de bloque, que absorbe el error de
+        // 0,4 ms de la calibracion sin tirar por la borda su precision.
+        val margen = b / 4
+        val nuevo = (muestrasRetardo - margen).coerceAtLeast(0)
+        retardoAplicado = nuevo
+        retardoAnterior = nuevo
+        retardoMs = muestrasRetardo * 1000f / fs
+        retardoFijado = true
+        // Alineacion nueva: los pesos viejos no valen, igual que cuando la
+        // mueve el estimador.
+        java.util.Arrays.fill(wRe, 0f)
+        java.util.Arrays.fill(wIm, 0f)
+        acoplamiento = 0f
+        bloquesConReferencia = 0
+        filtroCongelado = false
+        bloquesBuenos = 0
+        bloquesMalos = 0
+
+        // HAY QUE TIRAR TAMBIEN EL HISTORIAL DE LA REFERENCIA Y LA POTENCIA
+        // POR BIN, y esto es lo que hacia divergir el AEC al calibrar.
+        //
+        // El sintoma, medido con referencia ajena (lazo abierto) y el camino
+        // portatil: llamando a fijaRetardo en t=0 salian 0,00 dB de ERLE y
+        // 3.852 divergencias; llamando exactamente al mismo valor en t=1 s
+        // salian 32,40 dB y CERO divergencias. El retardo era el mismo, asi
+        // que no era cuestion de alineacion.
+        //
+        // La causa: nada mas arrancar, `potBin` esta a ceros y el historial de
+        // espectros `xRe`/`xIm` tambien. El paso del NLMS se normaliza
+        // dividiendo por esa potencia, con un suelo que se calcula como una
+        // fraccion de la potencia MEDIA... que tambien es cero. Asi que el
+        // primer bloque tras fijar el retardo divide por el suelo de `delta`
+        // (1e-6) y da un paso enorme guiado por un gradiente que aun no
+        // significa nada. Con eso el filtro sale disparado y ya no vuelve.
+        //
+        // Cuando quien mueve la alineacion es el estimador automatico esto no
+        // pasaba nunca, porque el estimador no se pronuncia hasta los ~2 s y
+        // para entonces `potBin` lleva rato con valores buenos. La calibracion
+        // rompe esa suposicion: fija el retardo cuando le da la gana, que
+        // normalmente es nada mas arrancar.
+        //
+        // Poniendo el historial a cero Y reiniciando el contador de bloques,
+        // la potencia se vuelve a aprender desde el primer bloque con
+        // referencia de verdad, y el primer paso ya sale normalizado con algo
+        // que significa algo.
+        java.util.Arrays.fill(xRe, 0f)
+        java.util.Arrays.fill(xIm, 0f)
+        xCabeza = 0
+        // Las energias suavizadas tambien se resiembran: venian de la
+        // alineacion vieja y el detector de doble habla las usa.
+        enMic = 1e-10f; enErr = 1e-10f; enRef = 1e-10f; enEco = 1e-10f
+
+        // OJO: `potBin` NO se toca, y es importante.
+        //
+        // La tentacion es ponerlo a cero tambien, "para empezar limpio". Se
+        // probo y es exactamente lo que NO hay que hacer: `potBin` es el
+        // denominador del NLMS, y con el a cero el suelo de normalizacion cae
+        // a `delta` (1e-6), el primer paso se dispara y el filtro diverge.
+        // Medido: poniendolo a cero, el caso que daba 32,40 dB pasaba a 0,00
+        // dB con 3.725 divergencias. La potencia aprendida sigue siendo buena
+        // aunque cambie la alineacion, porque la referencia es la misma senal.
+    }
+
+    /** Si el retardo lo ha puesto la calibracion en vez del estimador. */
+    private var retardoFijado = false
 
     /**
      * Retardo que anade el AEC, en muestras. Es el del bloque: la muestra que
@@ -2469,7 +2873,21 @@ class CanceladorEco(
         //    que entra ahora por el microfono.
         var iUlt = refEscribe - 1
         if (iUlt < 0) iUlt += refCap
-        if (estimador.empuja(ref[iUlt], m)) {
+        // Si hay un retardo de calibracion esperando a que haya referencia
+        // suficiente, se aplica en cuanto la haya. Ver [fijaRetardo].
+        if (retardoPendiente >= 0) {
+            val minimo = (p * b * 2).coerceAtLeast(2 * fs / 10)
+            if (refTotal >= minimo) {
+                val v = retardoPendiente
+                retardoPendiente = -1
+                aplicaRetardo(v)
+            }
+        }
+
+        // Si el retardo lo puso la CALIBRACION, el estimador no lo toca: una
+        // medida hecha en silencio con una senal conocida es mejor dato que
+        // lo que la correlacion pueda adivinar con el lazo cerrado.
+        if (!retardoFijado && estimador.empuja(ref[iUlt], m)) {
             val est = estimador.muestras
             if (est >= 0) {
                 retardoMs = est * 1000f / fs
@@ -2758,7 +3176,67 @@ class CanceladorEco(
             }
         }
 
-        adaptando = hayReferencia && !dobleHabla
+        // --- f2) CONGELACION POR CONVERGENCIA (geometria fija) --------------
+        //
+        // Ver el comentario de [congelaSiConverge]. La idea es que en un
+        // megafono portatil el camino no cambia, asi que una vez aprendido no
+        // hay nada que ganar readaptando y si mucho que perder: en lazo
+        // cerrado cada actualizacion arrastra el sesgo de que la referencia
+        // es la propia voz del usuario.
+        //
+        // El ERLE se mira YA SUAVIZADO (enMic/enErr llevan ~50 ms de memoria),
+        // asi que un bloque suelto no decide nada; ademas se exige que se
+        // mantenga varios segundos seguidos.
+        if (congelaSiConverge) {
+            if (!filtroCongelado) {
+                // Solo cuenta como bloque bueno si ademas habia referencia:
+                // un ERLE alto con el altavoz mudo no significa nada (no hay
+                // eco que cancelar, asi que cancelar "todo" es gratis).
+                // EL CONTADOR SUBE Y BAJA, NO SE REINICIA DE GOLPE.
+                //
+                // Exigir una racha SEGUIDA de bloques buenos no funciona con
+                // voz: entre silaba y silaba hay huecos donde no hay eco que
+                // cancelar, el ERLE medido se desploma y el contador se
+                // quedaria a cero una y otra vez. Medido: con reinicio de
+                // golpe, el filtro no llegaba a congelar NUNCA en 20 s, aunque
+                // llevara desde el segundo 6 dando 30 dB.
+                //
+                // Subiendo de uno en uno con los bloques buenos y bajando de
+                // uno en uno con los malos, lo que se mide es el BALANCE: si
+                // la mayoria de los bloques con voz van bien, el contador
+                // sube, y los huecos solo lo frenan un poco.
+                if (hayReferencia && erleDb >= erleParaCongelar) {
+                    bloquesBuenos++
+                    if (bloquesBuenos >= bloquesParaCongelar) {
+                        filtroCongelado = true
+                        bloquesMalos = 0
+                    }
+                } else if (bloquesBuenos > 0) {
+                    bloquesBuenos--
+                }
+            } else {
+                // Congelado: se vigila que siga cancelando. Si deja de
+                // hacerlo durante un rato es que la geometria ha cambiado de
+                // verdad y toca volver a aprender.
+                if (hayReferencia && erleDb < erleParaDescongelar) {
+                    bloquesMalos++
+                    if (bloquesMalos >= bloquesParaDescongelar) {
+                        filtroCongelado = false
+                        bloquesMalos = 0
+                        bloquesBuenos = 0
+                    }
+                } else {
+                    bloquesMalos = 0
+                }
+            }
+        } else if (filtroCongelado) {
+            // Han apagado la congelacion desde la pantalla: se descongela.
+            filtroCongelado = false
+            bloquesBuenos = 0
+            bloquesMalos = 0
+        }
+
+        adaptando = hayReferencia && !dobleHabla && !filtroCongelado
 
         if (!adaptando) return
 
@@ -2846,6 +3324,67 @@ class CanceladorEco(
                 wRe[ow + k] = fuga * wRe[ow + k] + paso * (ar * br - ai * bi)
                 wIm[ow + k] = fuga * wIm[ow + k] + paso * (ar * bi + ai * br)
             }
+        }
+
+        // --- h2) GUARDIA CONTRA LA DIVERGENCIA -------------------------------
+        //
+        // ESTO NO ES UN ADORNO DEFENSIVO: sin ello el AEC se va a Infinity en
+        // MEDIO SEGUNDO en cuanto se le alinea bien el retardo en lazo
+        // cerrado, y de ahi a NaN. Medido con la cadena entera, camino
+        // portatil y retardo calibrado a 203 ms:
+        //
+        //   t=0,2 s  norma  372      ERLE  -4 dB
+        //   t=0,5 s  norma  1,8e13   ERLE -20 dB
+        //   t=0,7 s  norma  Infinity ERLE   0 dB  <- y ya no vuelve
+        //
+        // Y el NaN es PEGAJOSO: enRef se queda en NaN, `enRef > 1e-8` da false
+        // para siempre, `hayReferencia` nunca vuelve a ser cierto y el AEC no
+        // adapta NUNCA MAS en toda la sesion. El usuario ve "ERLE 0,0 dB" y no
+        // hay forma de que se recupere sin reiniciar la cadena entera.
+        //
+        // POR QUE DIVERGE, que es lo que hay que entender. En lazo cerrado la
+        // referencia del AEC es SU PROPIA SALIDA amplificada (se apunta al
+        // final de la cadena, paso 10). Si el filtro se pasa de frenada y
+        // amplifica en vez de cancelar, esa salida mas grande vuelve como
+        // referencia mas grande, que hace un gradiente mayor, que amplifica
+        // mas: realimentacion positiva pura. La fuga (leaky NLMS) frena el
+        // paseo aleatorio de los pesos, pero no puede con una realimentacion
+        // que crece exponencialmente.
+        //
+        // No pasaba en las pruebas de lazo abierto porque alli la referencia
+        // es una senal externa fija: por mucho que el filtro se desmadre, la
+        // referencia no crece con el.
+        //
+        // LA GUARDIA. Si la norma de los pesos se dispara, el filtro se tira y
+        // se vuelve a empezar de cero. Perder la convergencia cuesta unos
+        // segundos; quedarse en NaN cuesta la sesion entera.
+        //
+        // El limite se pone sobre la norma porque es la medida que avisa
+        // ANTES: cuando un filtro va a divergir, la norma crece mucho antes de
+        // que el audio suene mal. Un camino acustico real con el microfono
+        // detras del cono tiene una norma muy por debajo de 1 (atenua 15-20
+        // dB), asi que un valor de 8 deja muchisimo margen a cualquier
+        // solucion legitima y sigue cazando la divergencia a tiempo.
+        var norma2 = 0f
+        for (i in wRe.indices) norma2 += wRe[i] * wRe[i] + wIm[i] * wIm[i]
+        // Se comprueba tambien que sea un numero: en cuanto aparece un NaN o
+        // un infinito hay que tirar los pesos, porque cualquier comparacion
+        // posterior contra ellos daria false y el filtro se quedaria zombi.
+        if (!(norma2 < limiteNorma * limiteNorma)) {
+            java.util.Arrays.fill(wRe, 0f)
+            java.util.Arrays.fill(wIm, 0f)
+            java.util.Arrays.fill(potBin, 0f)
+            // Las energias suavizadas tambien pueden llevar NaN dentro: si se
+            // dejan, el NaN vuelve a envenenar `hayReferencia` en el siguiente
+            // bloque y no habriamos arreglado nada.
+            enMic = 1e-10f; enErr = 1e-10f; enRef = 1e-10f; enEco = 1e-10f
+            acoplamiento = 0f
+            bloquesConReferencia = 0
+            filtroCongelado = false
+            bloquesBuenos = 0
+            bloquesMalos = 0
+            divergencias++
+            return
         }
 
         // --- i) Restriccion del gradiente, que NO es opcional ----------------
@@ -2958,6 +3497,270 @@ class CanceladorEco(
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// 13b) CALIBRADOR DEL CAMINO DE ECO
+// ---------------------------------------------------------------------------
+
+/**
+ * Mide el retardo REAL entre lo que sale por el altavoz y lo que vuelve por el
+ * microfono, emitiendo una senal de prueba conocida.
+ *
+ * POR QUE ESTO EXISTE, Y POR QUE ES LA PIEZA QUE FALTABA.
+ *
+ * El [EstimadorRetardo] automatico funciona muy bien en lazo ABIERTO y no
+ * funciona en lazo CERRADO, y no es un fallo suyo: en un megafono lo que sale
+ * por el altavoz ES la voz que acaba de entrar por el microfono, asi que
+ * referencia y microfono se parecen muchisimo a desfase casi cero. La
+ * correlacion no tiene un pico en el retardo del eco; baja monotona desde
+ * cero, dominada por el parecido de la voz consigo misma. Sin alineacion, el
+ * eco cae fuera de la ventana del filtro adaptativo y el AEC cancela CERO.
+ *
+ * La calibracion rompe ese circulo cambiando las condiciones: durante 1-2
+ * segundos el usuario se calla, nosotros emitimos una senal que NO es su voz,
+ * y medimos con ella. Entonces la correlacion si tiene un pico limpio, porque
+ * la referencia ya no se parece a nada mas de lo que hay en el microfono.
+ * Es exactamente lo que hacen los sistemas profesionales de megafonia fija
+ * cuando se calibran contra la sala al instalarlos.
+ *
+ * En un megafono portatil esto es MUY efectivo porque la geometria es casi
+ * constante: lo que se mide una vez sigue valiendo. En megafonia de sala
+ * habria que recalibrar cada poco y no valdria la pena.
+ *
+ * QUE SENAL SE EMITE, Y POR QUE ESA. Una rafaga corta de ruido paso banda
+ * (300-3000 Hz, la banda de la voz) modulada por una ventana suave:
+ *
+ *  - RUIDO y no un tono: un tono puro no sirve para medir retardo, porque
+ *    todas sus repeticiones son iguales y la correlacion tiene picos cada
+ *    periodo. El ruido tiene una autocorrelacion que es una AGUJA, que es
+ *    justo lo que hace falta para medir retardo con precision.
+ *  - PASO BANDA en la banda de voz: fuera de ahi el altavoz no radia y el
+ *    microfono no recoge, asi que la energia que se meta ahi solo sirve para
+ *    molestar al que pasa por la calle.
+ *  - VENTANA SUAVE: sin ella la rafaga empieza y acaba con un chasquido, que
+ *    ademas de sonar mal excita el altavoz de forma no lineal.
+ *
+ * COMO SE MIDE. Correlacion cruzada por FFT entre lo emitido y lo captado, con
+ * las FORMAS DE ONDA (no las envolventes): aqui si se puede, porque sabemos
+ * exactamente que hemos emitido y sabemos que no hay voz encima. La forma de
+ * onda da una resolucion de UNA muestra (0,02 ms), muchisimo mejor que los
+ * 2,7 ms de la envolvente.
+ *
+ * SE USA ASI, desde el hilo de audio:
+ *
+ *   cal.arranca()
+ *   ... en cada muestra:  salida = cal.siguienteMuestra(microfono)
+ *   ... cuando cal.terminado:  aec.fijaRetardo(cal.retardoMuestras)
+ *
+ * Mientras dura, [siguienteMuestra] devuelve la senal de prueba y el resto de
+ * la cadena no debe sonar: el usuario ve un aviso de "no hables".
+ */
+class CalibradorEco(
+    private val fs: Int,
+    /** Retardo maximo que se va a buscar, en ms. El A2DP no pasa de ~400. */
+    msMaximo: Float = 500f
+) {
+    /**
+     * Duracion de la rafaga de prueba. 250 ms de ruido dan energia de sobra
+     * para que el pico de correlacion destaque sobre el ruido de la calle, y
+     * son lo bastante cortos como para que nadie se asuste.
+     */
+    private val muestrasRafaga = (0.25f * fs).toInt()
+
+    /**
+     * Cuanto se escucha DESPUES de acabar la rafaga. Tiene que cubrir el
+     * retardo maximo mas la cola del camino, o el eco llegaria cuando ya hemos
+     * dejado de grabar.
+     */
+    private val muestrasEscucha = ((msMaximo + 100f) / 1000f * fs).toInt()
+
+    /** Total de muestras que dura la calibracion. */
+    private val total = muestrasRafaga + muestrasEscucha
+
+    /**
+     * Tamano de la FFT: tiene que ser al menos el doble del tramo analizado
+     * para que la correlacion circular no se enrolle sobre si misma.
+     */
+    private val n = siguientePotenciaDe2(total * 2)
+
+    private val fft = Fft(n)
+
+    /** Lo emitido y lo captado, guardados enteros para correlarlos al final. */
+    private val emitido = FloatArray(total)
+    private val captado = FloatArray(total)
+
+    // Espacio de trabajo para la correlacion, preasignado.
+    private val aRe = FloatArray(n)
+    private val aIm = FloatArray(n)
+
+    // Filtros que dan forma a la rafaga de ruido.
+    private val hp = Biquad()
+    private val lp = Biquad()
+    private val r = java.util.Random(20260914L)
+
+    private var i = 0
+
+    /** Amplitud de la rafaga. 0,25 se oye claro sin molestar ni saturar. */
+    @Volatile var amplitud = 0.25f
+
+    /** true cuando ya hay resultado. */
+    @Volatile var terminado = false; private set
+
+    /** Retardo medido, en muestras. -1 si no se pudo medir. */
+    @Volatile var retardoMuestras = -1; private set
+
+    /** Retardo medido en ms, para la pantalla. -1 si no se pudo. */
+    @Volatile var retardoMs = -1f; private set
+
+    /**
+     * Lo claro que salio el pico, 0..1. Por debajo de ~0,3 la medida no es de
+     * fiar: normalmente significa que el altavoz estaba mudo, que el volumen
+     * estaba al minimo o que habia un ruido enorme alrededor.
+     */
+    @Volatile var calidad = 0f; private set
+
+    /** Cuanto queda, 0..1, para pintar una barra de progreso. */
+    val progreso: Float get() = (i.toFloat() / total).coerceIn(0f, 1f)
+
+    fun arranca() {
+        java.util.Arrays.fill(emitido, 0f)
+        java.util.Arrays.fill(captado, 0f)
+        i = 0
+        terminado = false
+        retardoMuestras = -1
+        retardoMs = -1f
+        calidad = 0f
+        hp.pasoAlto(300f, 0.707f, fs)
+        lp.pasoBajoRbj(3000f, 0.707f, fs)
+        hp.reiniciar()
+        lp.reiniciar()
+    }
+
+    /**
+     * Una muestra. Se le da lo que entra por el microfono y devuelve lo que
+     * hay que mandar al altavoz.
+     *
+     * Cuando [terminado] se pone a true ya no hay que llamar mas: devuelve
+     * silencio y no toca nada.
+     */
+    fun siguienteMuestra(microfono: Float): Float {
+        if (terminado) return 0f
+
+        var salida = 0f
+        if (i < muestrasRafaga) {
+            // Ruido blanco filtrado a la banda de voz, con ventana suave en
+            // los dos extremos para que no haya chasquido.
+            val blanco = (r.nextFloat() * 2f - 1f)
+            var v = lp.procesa(hp.procesa(blanco))
+            // Ventana de Hann sobre la rafaga entera.
+            val w = 0.5f - 0.5f * cos(2.0 * Math.PI * i / (muestrasRafaga - 1)).toFloat()
+            v *= w * amplitud
+            salida = v
+        }
+        emitido[i] = salida
+        captado[i] = microfono
+        i++
+
+        if (i >= total) {
+            calcula()
+            terminado = true
+        }
+        return salida
+    }
+
+    /**
+     * Correlacion cruzada por FFT entre emitido y captado.
+     *
+     * corr = IFFT( conj(FFT(emitido)) * FFT(captado) ). El pico cae en el
+     * desfase k tal que captado[t] se parece a emitido[t-k], que es
+     * exactamente el retardo de ida y vuelta que buscamos.
+     */
+    private fun calcula() {
+        // FFT de lo emitido.
+        java.util.Arrays.fill(fft.re, 0f)
+        java.util.Arrays.fill(fft.im, 0f)
+        System.arraycopy(emitido, 0, fft.re, 0, total)
+        fft.transforma()
+        System.arraycopy(fft.re, 0, aRe, 0, n)
+        System.arraycopy(fft.im, 0, aIm, 0, n)
+
+        // FFT de lo captado.
+        java.util.Arrays.fill(fft.re, 0f)
+        java.util.Arrays.fill(fft.im, 0f)
+        System.arraycopy(captado, 0, fft.re, 0, total)
+        fft.transforma()
+
+        // conj(EMITIDO) * CAPTADO.
+        for (k in 0 until n) {
+            val ar = aRe[k]
+            val ai = -aIm[k]
+            val br = fft.re[k]
+            val bi = fft.im[k]
+            fft.re[k] = ar * br - ai * bi
+            fft.im[k] = ar * bi + ai * br
+        }
+        // IFFT (conjugar, transformar, quedarse con la parte real).
+        for (k in 0 until n) fft.im[k] = -fft.im[k]
+        fft.transforma()
+
+        // El eco no puede llegar antes de salir: solo desfases positivos. Y no
+        // mas alla de la ventana de escucha, porque a partir de ahi la
+        // referencia se sale del tramo emitido y la correlacion no significa
+        // nada.
+        var mejor = -1
+        var mejorV = 0f
+        for (k in 0 until muestrasEscucha) {
+            val v = fft.re[k] / n
+            if (v > mejorV) { mejorV = v; mejor = k }
+        }
+        if (mejor < 0 || mejorV <= 0f) {
+            calidad = 0f
+            retardoMuestras = -1
+            retardoMs = -1f
+            return
+        }
+
+        // Cuanto destaca el pico sobre el suelo de la correlacion. Se mide
+        // LEJOS del pico, que es donde de verdad se ve el ruido de fondo; la
+        // zona pegada al pico es la falda del propio pico y no es suelo.
+        // Un margen de 2 ms a cada lado basta: la autocorrelacion de un ruido
+        // paso banda de 300-3000 Hz se apaga en mucho menos que eso.
+        val margen = (0.002f * fs).toInt().coerceAtLeast(8)
+        var suma = 0f
+        var cuantos = 0
+        for (k in 0 until muestrasEscucha) {
+            if (k < mejor - margen || k > mejor + margen) {
+                val v = fft.re[k] / n
+                suma += if (v < 0f) -v else v
+                cuantos++
+            }
+        }
+        val suelo = if (cuantos > 0) suma / cuantos else 0f
+        val destaca = if (suelo > 1e-20f) mejorV / suelo else 0f
+        // Un pico 10 veces el suelo ya es una deteccion redonda. Con la senal
+        // de prueba (ruido, autocorrelacion en aguja) y sin voz encima, lo
+        // normal es pasar de eso con holgura; si no se llega, es que el
+        // altavoz no estaba sonando.
+        calidad = (destaca / 10f).coerceIn(0f, 1f)
+
+        // Solo se acepta si destaca de verdad. Mas vale no dar retardo (y que
+        // el AEC se quede como estaba) que dar uno inventado, que desalinea el
+        // filtro y lo deja cancelando cero.
+        if (destaca >= 4f) {
+            retardoMuestras = mejor
+            retardoMs = mejor * 1000f / fs
+        } else {
+            retardoMuestras = -1
+            retardoMs = -1f
+        }
+    }
+
+    private fun siguientePotenciaDe2(v: Int): Int {
+        var x = 1
+        while (x < v) x = x shl 1
+        return x
+    }
+}
 // ---------------------------------------------------------------------------
 // 14) FILTRO DE VOZ POR ESTRUCTURA ARMONICA
 // ---------------------------------------------------------------------------
